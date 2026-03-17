@@ -1,0 +1,5 @@
+# Ignore locally generated cleaned data
+gold_clean_data/
+
+# Python bytecode caches
+__pycache__/
