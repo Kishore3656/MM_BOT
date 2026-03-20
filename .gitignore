@@ -1,5 +1,21 @@
 # Ignore locally generated cleaned data
 gold_clean_data/
 
+# Python virtual environment
+.venv/
+
 # Python bytecode caches
 __pycache__/
+*.pyc
+PDF/
+
+# Runtime artifacts
+bot.log
+bot_test.log
+trades.csv
+
+# Claude memory (local AI assistant context)
+.claude/
+
+# IDE
+.vscode/

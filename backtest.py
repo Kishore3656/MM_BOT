@@ -23,9 +23,15 @@ import numpy as np
 import pandas as pd
 
 # ── Fee / cost model ──────────────────────────────────────────────────────────
-CRYPTO_FEE_PCT: float = 0.0005   # 0.05 % per side
-FOREX_SPREAD:   float = 1.5      # pips (1 pip = 0.0001 for major pairs)
-FOREX_PIP:      float = 0.0001
+CRYPTO_FEE_PCT:     float = 0.0005   # 0.05 % per side
+FOREX_SPREAD:       float = 1.5      # pips (1 pip = 0.0001 for major pairs)
+FOREX_PIP:          float = 0.0001
+STOCK_COMMISSION:   float = 0.001    # 0.10 % per side (typical retail broker)
+COMMODITY_SPREAD:   float = 0.002    # 0.20 % per side (soft commodity futures)
+INDEX_SPREAD:       float = 0.0005   # 0.05 % per side (CFD/ETF spread proxy)
+FUTURES_SPREAD:     float = 0.0003   # 0.03 % per side (commodity futures: GC, CL, SI, NG)
+FIN_FUTURES_SPREAD: float = 0.00005  # 0.005% per side (financial futures: ES, NQ, YM, ZB, ZN)
+                                      # ~$2-5 commission + 1-tick spread on a $5k-$20k contract
 
 # ── Position sizing ───────────────────────────────────────────────────────────
 RISK_PCT: float = 0.01           # 1 % of equity per trade
@@ -48,6 +54,16 @@ def _entry_cost(entry: float, size: float, instrument: str) -> float:
     """Round-trip cost at entry side only."""
     if instrument == "crypto":
         return entry * size * CRYPTO_FEE_PCT
+    if instrument == "stock":
+        return entry * size * STOCK_COMMISSION
+    if instrument == "commodity":
+        return entry * size * COMMODITY_SPREAD
+    if instrument == "index":
+        return entry * size * INDEX_SPREAD
+    if instrument == "futures":
+        return entry * size * FUTURES_SPREAD
+    if instrument == "fin_futures":
+        return entry * size * FIN_FUTURES_SPREAD
     # forex: cost = spread × size (spread already in price units via pip)
     return FOREX_SPREAD * FOREX_PIP * size
 
@@ -55,13 +71,28 @@ def _entry_cost(entry: float, size: float, instrument: str) -> float:
 def _exit_cost(price: float, size: float, instrument: str) -> float:
     if instrument == "crypto":
         return price * size * CRYPTO_FEE_PCT
+    if instrument == "stock":
+        return price * size * STOCK_COMMISSION
+    if instrument == "commodity":
+        return price * size * COMMODITY_SPREAD
+    if instrument == "index":
+        return price * size * INDEX_SPREAD
+    if instrument == "futures":
+        return price * size * FUTURES_SPREAD
+    if instrument == "fin_futures":
+        return price * size * FIN_FUTURES_SPREAD
     return FOREX_SPREAD * FOREX_PIP * size
 
 
 def _bars_after(df_5m: pd.DataFrame, ts: pd.Timestamp) -> pd.DataFrame:
-    """Slice df from the first bar at or after ts."""
+    """Slice df starting from the bar AFTER ts.
+
+    The signal fires at the close of bar `ts`, so the trade is only active
+    from the following bar onward.  Including the signal bar itself caused the
+    bar's pre-entry high/low to trigger phantom TP1 or SL hits.
+    """
     idx = df_5m.index.searchsorted(ts)
-    return df_5m.iloc[idx:]
+    return df_5m.iloc[idx + 1:]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -247,7 +278,7 @@ def run_backtest(
         size = risk_amount / distance
 
         future_bars = _bars_after(df_5m, bar_time)
-        if len(future_bars) < 2:
+        if len(future_bars) < 1:
             continue
 
         trade = _simulate_trade(
@@ -452,13 +483,16 @@ def full_wf_report(
     # Walk-forward
     wf = walk_forward(df_5m, signals, instrument, initial_equity)
     if "error" not in wf:
-        print(f"\n  Walk-forward (split {wf['split_date'].date()})")
-        print(f"    IS  Sharpe={wf['is_stats']['sharpe']:.2f}  "
-              f"return={wf['is_stats']['total_return_pct']:.1f}%")
-        print(f"    OOS Sharpe={wf['oos_stats']['sharpe']:.2f}  "
-              f"return={wf['oos_stats']['total_return_pct']:.1f}%")
-        if wf["overfit_flag"]:
-            print("  *** WARNING: likely overfit — OOS Sharpe < 70% of IS Sharpe ***")
+        is_s  = wf["is_stats"]
+        oos_s = wf["oos_stats"]
+        if "error" not in is_s and "error" not in oos_s:
+            print(f"\n  Walk-forward (split {wf['split_date'].date()})")
+            print(f"    IS  Sharpe={is_s['sharpe']:.2f}  "
+                  f"return={is_s['total_return_pct']:.1f}%")
+            print(f"    OOS Sharpe={oos_s['sharpe']:.2f}  "
+                  f"return={oos_s['total_return_pct']:.1f}%")
+            if wf["overfit_flag"]:
+                print("  *** WARNING: likely overfit — OOS Sharpe < 70% of IS Sharpe ***")
 
     if plot:
         _plot_results(all_trades, stats)
@@ -588,8 +622,10 @@ if __name__ == "__main__":
     from signal_engine import _build_conditions, _align_htf
     import numpy as _np
     df5m = enriched["5m"]
-    _htf_struct = _align_htf(enriched["4h"], df5m.index, ["structure"])["structure"]
-    _conds = _build_conditions(df5m, _htf_struct, choch_lookback=10)
+    df4h = enriched["4h"]
+    _htf_struct = _align_htf(df4h, df5m.index, ["structure"])["structure"]
+    _df1h = enriched.get("1h")
+    _conds = _build_conditions(df5m, df4h, _htf_struct, choch_lookback=10, df_1h=_df1h)
     _bear_mask = _htf_struct == "bearish"
     print("\n  Short condition hit rates (on bearish HTF bars):")
     for _name, (_cl, _cs) in _conds.items():

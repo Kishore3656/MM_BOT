@@ -46,11 +46,118 @@ IMPULSE_BODY_MULT: float = 1.5   # body of middle candle ≥ mult × rolling avg
 AVG_BODY_WINDOW:   int   = 20    # lookback bars for avg-body calculation
 OB_LOOKBACK:       int   = 5     # bars back to find the opposing candle for OB
 BPR_IDX_WINDOW:    int   = 50    # max bar-distance for a bull/bear FVG BPR pair
+ZONE_LOOKBACK:     int   = 2000  # bars to look back for multi-zone bear active check
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Helpers
 # ══════════════════════════════════════════════════════════════════════════════
+
+class _Fenwick:
+    """Fenwick tree over counts; supports 'first 1 at/after idx' queries."""
+
+    def __init__(self, n: int):
+        self.n = int(n)
+        self.bit = np.zeros(self.n + 1, dtype=np.int32)
+
+    def add(self, idx0: int, delta: int = 1) -> None:
+        i = int(idx0) + 1
+        n = self.n
+        bit = self.bit
+        while i <= n:
+            bit[i] += delta
+            i += i & -i
+
+    def sum(self, idx0: int) -> int:
+        """Prefix sum over [0..idx0] inclusive."""
+        i = int(idx0) + 1
+        s = 0
+        bit = self.bit
+        while i > 0:
+            s += int(bit[i])
+            i -= i & -i
+        return s
+
+    def total(self) -> int:
+        return self.sum(self.n - 1) if self.n else 0
+
+    def find_by_order(self, k: int) -> int:
+        """
+        Return smallest idx such that prefix_sum(idx) >= k.
+        Requires 1 <= k <= total().
+        """
+        idx = 0
+        bit = self.bit
+        # Largest power of two >= n
+        step = 1 << (self.n.bit_length())
+        while step:
+            nxt = idx + step
+            if nxt <= self.n and bit[nxt] < k:
+                k -= int(bit[nxt])
+                idx = nxt
+            step >>= 1
+        return idx  # 0-based (since idx is last < k in 1-based space)
+
+
+def _first_touch_indices_threshold_leq(
+    threshold: np.ndarray,
+    start_idx: np.ndarray,
+    series: np.ndarray,
+) -> np.ndarray:
+    """
+    For each query q: find the earliest j >= start_idx[q] such that series[j] <= threshold[q].
+    Returns first_touch_idx (int), with n meaning "never touched".
+
+    Offline algorithm:
+      - sort bars by series ascending (activate bars with series <= current threshold)
+      - sort queries by threshold ascending
+      - Fenwick tree over activated bar indices; query next active >= start via order-statistic.
+    """
+    n = int(series.shape[0])
+    out = np.full(len(threshold), n, dtype=np.int32)
+    if n == 0 or len(threshold) == 0:
+        return out
+
+    bar_order = np.argsort(series, kind="mergesort")
+    q_order = np.argsort(threshold, kind="mergesort")
+
+    ft = _Fenwick(n)
+    bi = 0
+    total = 0
+
+    for qi in q_order:
+        thr = threshold[qi]
+        while bi < n and series[bar_order[bi]] <= thr:
+            ft.add(int(bar_order[bi]), 1)
+            total += 1
+            bi += 1
+
+        s = int(start_idx[qi])
+        if total == 0 or s >= n:
+            continue
+
+        before = ft.sum(s - 1) if s > 0 else 0
+        if before >= total:
+            continue
+
+        j = ft.find_by_order(before + 1)
+        out[qi] = int(j)
+
+    return out
+
+
+def _first_touch_indices_threshold_geq(
+    threshold: np.ndarray,
+    start_idx: np.ndarray,
+    series: np.ndarray,
+) -> np.ndarray:
+    """
+    For each query q: find the earliest j >= start_idx[q] such that series[j] >= threshold[q].
+    Returns first_touch_idx (int), with n meaning "never touched".
+    """
+    # Convert >= into <= by negating both sides.
+    return _first_touch_indices_threshold_leq(-threshold, start_idx, -series)
+
 
 def _compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     prev_c = df["close"].shift(1)
@@ -77,20 +184,87 @@ def _suffix_arrays(df: pd.DataFrame):
     )
 
 
-def _first_touch_bull(start: int, bottom: float, top: float,
-                      low_arr: np.ndarray, close_arr: np.ndarray,
-                      suf_min: np.ndarray) -> str:
-    """Status for a bullish FVG: always 'open' at formation time.
-    Active-zone detection is handled bar-by-bar in _enrich_df via price-in-zone check."""
-    return "open"
+def _status_from_first_touch(
+    zone_type: str,
+    top: float,
+    bottom: float,
+    first_touch_idx: int,
+    close_arr: np.ndarray,
+    n: int,
+) -> str:
+    """
+    End-of-dataset status classification based on the first touch bar.
+    This is used for the zone catalogue (fvg_list / ob_list) only.
+
+    Time-aware activeness at bar T is computed separately in _enrich_df.
+    """
+    if first_touch_idx >= n:
+        return "open"
+    c = float(close_arr[int(first_touch_idx)])
+    if zone_type in ("bullish", "breaker_bullish"):
+        return "inverted" if c < bottom else "mitigated"
+    if zone_type in ("bearish", "breaker_bearish"):
+        return "inverted" if c > top else "mitigated"
+    return "mitigated"
 
 
-def _first_touch_bear(start: int, bottom: float, top: float,
-                      high_arr: np.ndarray, close_arr: np.ndarray,
-                      suf_max: np.ndarray) -> str:
-    """Status for a bearish FVG: always 'open' at formation time.
-    Active-zone detection is handled bar-by-bar in _enrich_df via price-in-zone check."""
-    return "open"
+def _timeaware_active_last_zone(
+    n: int,
+    created_idx: np.ndarray,
+    first_touch_idx: np.ndarray,
+    top: np.ndarray,
+    bottom: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    For each bar t, track the most-recent zone that is still 'open as-of t':
+      created_idx <= t < first_touch_idx
+
+    Returns:
+      last_top[t], last_bottom[t], any_active[t]
+    """
+    import heapq
+
+    last_top = np.full(n, np.nan, dtype=float)
+    last_bottom = np.full(n, np.nan, dtype=float)
+    any_active = np.zeros(n, dtype=bool)
+
+    if n == 0 or len(created_idx) == 0:
+        return last_top, last_bottom, any_active
+
+    created_idx = created_idx.astype(np.int32, copy=False)
+    first_touch_idx = first_touch_idx.astype(np.int32, copy=False)
+
+    # Group zones by created index for O(1) add.
+    order = np.argsort(created_idx, kind="mergesort")
+    ci_sorted = created_idx[order]
+    ft_sorted = first_touch_idx[order]
+    top_sorted = top[order]
+    bot_sorted = bottom[order]
+
+    # Max-heap keyed by created_idx (store negative for heapq) with lazy deletion by expiry.
+    heap: list[tuple[int, int]] = []  # (-created_idx, ptr)
+
+    ptr = 0
+    m = len(ci_sorted)
+    for t in range(n):
+        while ptr < m and int(ci_sorted[ptr]) == t:
+            if int(ft_sorted[ptr]) > t:  # zone must survive at least this bar
+                heapq.heappush(heap, (-int(ci_sorted[ptr]), ptr))
+            ptr += 1
+
+        # Drop zones that are touched at/ before t.
+        while heap:
+            _, p = heap[0]
+            if int(ft_sorted[p]) <= t:
+                heapq.heappop(heap)
+                continue
+            # Valid top zone
+            any_active[t] = True
+            last_top[t] = float(top_sorted[p])
+            last_bottom[t] = float(bot_sorted[p])
+            break
+
+    return last_top, last_bottom, any_active
 
 
 def _align_to_index(df_index: pd.DatetimeIndex,
@@ -105,6 +279,56 @@ def _align_to_index(df_index: pd.DatetimeIndex,
     s = s.groupby(level=0).last().sort_index()
     combined = s.reindex(s.index.union(df_index)).ffill()
     return combined.reindex(df_index)
+
+
+def _multi_zone_active(
+    df_index: pd.DatetimeIndex,
+    close: pd.Series,
+    zones_df: pd.DataFrame,
+    zone_type: str,
+    lookback: int,
+) -> pd.Series:
+    """
+    Multi-zone bearish active: True at bar T if close[T] is between the
+    rolling-min bottom and rolling-max top of all zones of `zone_type`
+    formed within the past `lookback` bars.
+
+    Replaces single-zone _align_to_index for bearish zones where gold's
+    uptrend causes the most-recent FVG to always sit above current price.
+    """
+    zones = zones_df[zones_df["type"] == zone_type]
+    if zones.empty:
+        return pd.Series(False, index=df_index)
+
+    bot_s = pd.Series(zones["bottom"].values, index=zones["timestamp"])
+    top_s = pd.Series(zones["top"].values,    index=zones["timestamp"])
+    bot_s = bot_s.groupby(level=0).min().sort_index()
+    top_s = top_s.groupby(level=0).max().sort_index()
+
+    # Map each zone timestamp to the first df bar after it
+    bar_idx = np.searchsorted(df_index.values, bot_s.index.values, side="right")
+    valid   = bar_idx < len(df_index)
+
+    bot_arr = np.full(len(df_index), np.nan)
+    top_arr = np.full(len(df_index), np.nan)
+
+    if valid.any():
+        vi = bar_idx[valid]
+        bv = bot_s.values[valid].astype(float)
+        tv = top_s.values[valid].astype(float)
+        tmp = pd.DataFrame({"pos": vi, "bot": bv, "top": tv})
+        by_bot = tmp.groupby("pos")["bot"].min()
+        by_top = tmp.groupby("pos")["top"].max()
+        bot_arr[by_bot.index.values] = by_bot.values
+        top_arr[by_top.index.values] = by_top.values
+
+    bot_sparse = pd.Series(bot_arr, index=df_index)
+    top_sparse = pd.Series(top_arr, index=df_index)
+
+    roll_min_bot = bot_sparse.rolling(lookback, min_periods=1).min()
+    roll_max_top = top_sparse.rolling(lookback, min_periods=1).max()
+
+    return ((close > roll_min_bot) & (close <= roll_max_top)).fillna(False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -169,7 +393,7 @@ def detect_fvg(df: pd.DataFrame, timeframe: str = "unknown") -> pd.DataFrame:
     high_arr  = high.values
     low_arr   = low.values
     close_arr = close.values
-    suf_min, suf_max = _suffix_arrays(df)
+    n = len(df)
 
     records: list[dict] = []
 
@@ -178,10 +402,9 @@ def detect_fvg(df: pd.DataFrame, timeframe: str = "unknown") -> pd.DataFrame:
         top_   = float(low_arr[i])
         if top_ <= bottom:
             continue
-        status = _first_touch_bull(i + 1, bottom, top_, low_arr, close_arr, suf_min)
         records.append({
             "type": "bullish", "top": top_, "bottom": bottom,
-            "timestamp": ts[i], "status": status,
+            "timestamp": ts[i], "status": "open",
             "timeframe": timeframe, "bpr": False, "_idx": i,
         })
 
@@ -190,14 +413,78 @@ def detect_fvg(df: pd.DataFrame, timeframe: str = "unknown") -> pd.DataFrame:
         bottom = float(high_arr[i])
         if top_ <= bottom:
             continue
-        status = _first_touch_bear(i + 1, bottom, top_, high_arr, close_arr, suf_max)
         records.append({
             "type": "bearish", "top": top_, "bottom": bottom,
-            "timestamp": ts[i], "status": status,
+            "timestamp": ts[i], "status": "open",
             "timeframe": timeframe, "bpr": False, "_idx": i,
         })
 
     fvg_df = pd.DataFrame(records)
+
+    # ── Time-aware lifecycle indices (offline O((n+zones) log n)) ────────────
+    # We track:
+    #   - first_touch_idx: first time price trades into the zone (wick touch)
+    #   - invalidation_idx: first time a *close* breaks beyond the far boundary (inversion)
+    #
+    # For trading (per the PDFs / A+ model), a zone remains valid after first touch
+    # (mitigation) until it inverts. "Active" for entries is handled in _enrich_df
+    # as "price currently inside a still-valid zone".
+    fvg_df["created_idx"] = fvg_df["_idx"].astype(np.int32)
+    start_idx = (fvg_df["created_idx"].values + 1).astype(np.int32, copy=False)
+
+    bull_mask2 = (fvg_df["type"].values == "bullish")
+    bear_mask2 = ~bull_mask2
+
+    first_touch = np.full(len(fvg_df), n, dtype=np.int32)
+    if bull_mask2.any():
+        first_touch[bull_mask2] = _first_touch_indices_threshold_leq(
+            threshold=fvg_df.loc[bull_mask2, "top"].values.astype(float, copy=False),
+            start_idx=start_idx[bull_mask2],
+            series=low_arr.astype(float, copy=False),
+        )
+    if bear_mask2.any():
+        first_touch[bear_mask2] = _first_touch_indices_threshold_geq(
+            threshold=fvg_df.loc[bear_mask2, "bottom"].values.astype(float, copy=False),
+            start_idx=start_idx[bear_mask2],
+            series=high_arr.astype(float, copy=False),
+        )
+
+    fvg_df["first_touch_idx"] = first_touch
+
+    # Invalidation (inversion) indices:
+    #   bullish FVG invalidates when close < bottom
+    #   bearish FVG invalidates when close > top
+    inv_idx = np.full(len(fvg_df), n, dtype=np.int32)
+    if bull_mask2.any():
+        thr = fvg_df.loc[bull_mask2, "bottom"].values.astype(float, copy=False)
+        # strict < via nextafter toward -inf
+        thr = np.nextafter(thr, -np.inf)
+        inv_idx[bull_mask2] = _first_touch_indices_threshold_leq(
+            threshold=thr,
+            start_idx=start_idx[bull_mask2],
+            series=close_arr.astype(float, copy=False),
+        )
+    if bear_mask2.any():
+        thr = fvg_df.loc[bear_mask2, "top"].values.astype(float, copy=False)
+        thr = np.nextafter(thr, np.inf)
+        inv_idx[bear_mask2] = _first_touch_indices_threshold_geq(
+            threshold=thr,
+            start_idx=start_idx[bear_mask2],
+            series=close_arr.astype(float, copy=False),
+        )
+    fvg_df["invalidation_idx"] = inv_idx
+
+    # Catalogue status is computed as-of end-of-dataset, but activeness is time-aware.
+    status = []
+    for r in fvg_df.itertuples(index=False):
+        # If invalidated at any point, mark inverted. Else if ever touched, mitigated. Else open.
+        if int(r.invalidation_idx) < n:
+            status.append("inverted")
+        elif int(r.first_touch_idx) < n:
+            status.append("mitigated")
+        else:
+            status.append("open")
+    fvg_df["status"] = status
 
     # ── BPR: sliding-window two-pointer — O(n·k) not O(n²) ───────────────────
     # Broadcasting was creating (n_bull × n_bear) arrays → OOM on large datasets.
@@ -291,7 +578,6 @@ def detect_ob(
 
     trigger_indices = np.flatnonzero(trigger)
 
-    suf_min, suf_max = _suffix_arrays(df)
     records: list[dict] = []
 
     for i in trigger_indices:
@@ -311,22 +597,11 @@ def detect_ob(
             if ob_idx is not None:
                 ob_hi = float(high[ob_idx])
                 ob_lo = float(low[ob_idx])
-                # Status: open until price enters OB from below (mitigated) or
-                # closes below OB low (inverted → breaker_bearish)
-                start = ob_idx + 1
-                status = "open"
                 ob_type = "bullish"
-                if start < n:
-                    if suf_max[start] >= ob_hi:
-                        j = start + int(np.argmax(close[start:] >= ob_hi))
-                        if close[j] < ob_lo:
-                            status, ob_type = "inverted", "breaker_bearish"
-                        else:
-                            status = "mitigated"
                 records.append({
                     "type": ob_type, "top": ob_hi, "bottom": ob_lo,
-                    "timestamp": ts[ob_idx], "status": status,
-                    "timeframe": timeframe,
+                    "timestamp": ts[ob_idx], "status": "open",
+                    "timeframe": timeframe, "_idx": int(ob_idx),
                 })
 
         # ── Bearish OB ───────────────────────────────────────────────────────
@@ -343,27 +618,78 @@ def detect_ob(
             if ob_idx is not None:
                 ob_hi = float(high[ob_idx])
                 ob_lo = float(low[ob_idx])
-                start = ob_idx + 1
-                status = "open"
                 ob_type = "bearish"
-                if start < n:
-                    if suf_min[start] <= ob_lo:
-                        j = start + int(np.argmax(close[start:] <= ob_lo))
-                        if close[j] > ob_hi:
-                            status, ob_type = "inverted", "breaker_bullish"
-                        else:
-                            status = "mitigated"
                 records.append({
                     "type": ob_type, "top": ob_hi, "bottom": ob_lo,
-                    "timestamp": ts[ob_idx], "status": status,
-                    "timeframe": timeframe,
+                    "timestamp": ts[ob_idx], "status": "open",
+                    "timeframe": timeframe, "_idx": int(ob_idx),
                 })
 
     if not records:
         return pd.DataFrame(
             columns=["type", "top", "bottom", "timestamp", "status", "timeframe"]
         )
-    return pd.DataFrame(records)
+    ob_df = pd.DataFrame(records)
+
+    # Time-aware lifecycle indices for OBs:
+    #   first_touch_idx: first retest into the OB
+    #   invalidation_idx: first close breaks beyond far boundary (breaker)
+    ob_df["created_idx"] = ob_df["_idx"].astype(np.int32)
+    start_idx = (ob_df["created_idx"].values + 1).astype(np.int32, copy=False)
+    first_touch = np.full(len(ob_df), n, dtype=np.int32)
+
+    bull_mask2 = (ob_df["type"].values == "bullish")
+    bear_mask2 = ~bull_mask2
+    if bull_mask2.any():
+        first_touch[bull_mask2] = _first_touch_indices_threshold_leq(
+            threshold=ob_df.loc[bull_mask2, "top"].values.astype(float, copy=False),
+            start_idx=start_idx[bull_mask2],
+            series=low.astype(float, copy=False),
+        )
+    if bear_mask2.any():
+        first_touch[bear_mask2] = _first_touch_indices_threshold_geq(
+            threshold=ob_df.loc[bear_mask2, "bottom"].values.astype(float, copy=False),
+            start_idx=start_idx[bear_mask2],
+            series=high.astype(float, copy=False),
+        )
+
+    ob_df["first_touch_idx"] = first_touch
+
+    inv_idx = np.full(len(ob_df), n, dtype=np.int32)
+    if bull_mask2.any():
+        thr = ob_df.loc[bull_mask2, "bottom"].values.astype(float, copy=False)
+        thr = np.nextafter(thr, -np.inf)
+        inv_idx[bull_mask2] = _first_touch_indices_threshold_leq(
+            threshold=thr,
+            start_idx=start_idx[bull_mask2],
+            series=close.astype(float, copy=False),
+        )
+    if bear_mask2.any():
+        thr = ob_df.loc[bear_mask2, "top"].values.astype(float, copy=False)
+        thr = np.nextafter(thr, np.inf)
+        inv_idx[bear_mask2] = _first_touch_indices_threshold_geq(
+            threshold=thr,
+            start_idx=start_idx[bear_mask2],
+            series=close.astype(float, copy=False),
+        )
+    ob_df["invalidation_idx"] = inv_idx
+
+    status: list[str] = []
+    new_type: list[str] = []
+    for r in ob_df.itertuples(index=False):
+        tp = str(r.type)
+        if int(r.invalidation_idx) < n:
+            status.append("inverted")
+            tp = "breaker_bearish" if tp == "bullish" else "breaker_bullish"
+        elif int(r.first_touch_idx) < n:
+            status.append("mitigated")
+        else:
+            status.append("open")
+        new_type.append(tp)
+    ob_df["status"] = status
+    ob_df["type"] = new_type
+
+    return ob_df.drop(columns=["_idx"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -396,38 +722,66 @@ def _enrich_df(
 
     # ── FVG columns ───────────────────────────────────────────────────────────
     if len(fvg_list):
-        for ftype, active_col, in_label, cmp_fn in [
+        for ftype, active_col, in_label, cmp_fn, touch_any in [
             ("bullish", "fvg_bull_active", "bull",
-             lambda top, bot, c: (c < top,  (c >= bot) & (c < top))),
+             lambda top, bot, c: (c < top,  (c >= bot) & (c < top)),
+             "low"),
             ("bearish", "fvg_bear_active", "bear",
-             lambda top, bot, c: (c > bot,  (c > bot)  & (c <= top))),
+             lambda top, bot, c: (c > bot,  (c > bot)  & (c <= top)),
+             "high"),
         ]:
-            open_fvgs = fvg_list[
-                (fvg_list["type"] == ftype) & (fvg_list["status"] == "open")
-            ]
-            if not len(open_fvgs):
+            zones = fvg_list[fvg_list["type"] == ftype]
+            if not len(zones):
                 continue
 
-            top_s = _align_to_index(df.index,
-                                    open_fvgs["timestamp"], open_fvgs["top"])
-            bot_s = _align_to_index(df.index,
-                                    open_fvgs["timestamp"], open_fvgs["bottom"])
+            if "created_idx" not in zones.columns:
+                # Back-compat: fall back to previous sparse ffill (treat end-status 'open' as active)
+                open_z = zones[zones["status"] == "open"]
+                if not len(open_z):
+                    continue
+                top_s = _align_to_index(df.index, open_z["timestamp"], open_z["top"])
+                bot_s = _align_to_index(df.index, open_z["timestamp"], open_z["bottom"])
+                active_mask, in_mask = cmp_fn(top_s, bot_s, close)
+                df[active_col] = active_mask.fillna(False)
+                df.loc[in_mask.fillna(False), "in_fvg"] = in_label
+                continue
 
+            # Prefer invalidation_idx (zone remains valid after touch until inversion)
+            expiry = zones["invalidation_idx"].values if "invalidation_idx" in zones.columns else zones["first_touch_idx"].values
+            last_top, last_bot, any_active = _timeaware_active_last_zone(
+                n=len(df),
+                created_idx=zones["created_idx"].values,
+                first_touch_idx=expiry,
+                top=zones["top"].values.astype(float, copy=False),
+                bottom=zones["bottom"].values.astype(float, copy=False),
+            )
+
+            top_s = pd.Series(last_top, index=df.index)
+            bot_s = pd.Series(last_bot, index=df.index)
             active_mask, in_mask = cmp_fn(top_s, bot_s, close)
-            df[active_col] = active_mask.fillna(False)
+            # For entries, "active" means price is currently in a still-valid zone.
+            in_now = in_mask.fillna(False).values
+            df[active_col] = (any_active & in_now)
 
-            has_bpr_col = "bpr" in open_fvgs.columns
-            bpr_open = open_fvgs[open_fvgs["bpr"]] if has_bpr_col else open_fvgs.iloc[:0]
-            if len(bpr_open):
-                bpr_top = _align_to_index(df.index,
-                                          bpr_open["timestamp"], bpr_open["top"])
-                bpr_bot = _align_to_index(df.index,
-                                          bpr_open["timestamp"], bpr_open["bottom"])
-                _, bpr_in = cmp_fn(bpr_top, bpr_bot, close)
-                in_mask = in_mask & ~bpr_in.fillna(False)
-                df.loc[bpr_in.fillna(False), "in_fvg"] = "bpr"
+            # BPR exclusion applies only when currently inside a BPR zone
+            if "bpr" in zones.columns and bool(zones["bpr"].any()):
+                bpr_z = zones[zones["bpr"]]
+                bpr_top, bpr_bot, bpr_any = _timeaware_active_last_zone(
+                    n=len(df),
+                    created_idx=bpr_z["created_idx"].values,
+                    first_touch_idx=bpr_z["first_touch_idx"].values,
+                    top=bpr_z["top"].values.astype(float, copy=False),
+                    bottom=bpr_z["bottom"].values.astype(float, copy=False),
+                )
+                _, bpr_in = cmp_fn(pd.Series(bpr_top, index=df.index),
+                                   pd.Series(bpr_bot, index=df.index), close)
+                bpr_in = (bpr_any & bpr_in.fillna(False).values)
+                in_mask = in_mask.fillna(False).values & ~bpr_in
+                df.loc[bpr_in, "in_fvg"] = "bpr"
+            else:
+                in_mask = in_mask.fillna(False).values
 
-            df.loc[in_mask.fillna(False), "in_fvg"] = in_label
+            df.loc[in_mask, "in_fvg"] = in_label
 
     # ── OB columns ────────────────────────────────────────────────────────────
     if len(ob_list):
@@ -437,20 +791,33 @@ def _enrich_df(
             ("bearish", "ob_bear_active", "bear",
              lambda hi, lo, c: (c > lo, (c > lo)  & (c <= hi))),
         ]:
-            open_obs = ob_list[
-                (ob_list["type"] == otype) & (ob_list["status"] == "open")
-            ]
-            if not len(open_obs):
+            zones = ob_list[ob_list["type"] == otype]
+            if not len(zones):
                 continue
 
-            top_s = _align_to_index(df.index,
-                                    open_obs["timestamp"], open_obs["top"])
-            bot_s = _align_to_index(df.index,
-                                    open_obs["timestamp"], open_obs["bottom"])
+            if "created_idx" not in zones.columns or "first_touch_idx" not in zones.columns:
+                open_z = zones[zones["status"] == "open"]
+                if not len(open_z):
+                    continue
+                top_s = _align_to_index(df.index, open_z["timestamp"], open_z["top"])
+                bot_s = _align_to_index(df.index, open_z["timestamp"], open_z["bottom"])
+                active_mask, in_mask = cmp_fn(top_s, bot_s, close)
+                df[active_col] = active_mask.fillna(False)
+                df.loc[in_mask.fillna(False), "in_ob"] = in_label
+                continue
 
+            last_top, last_bot, any_active = _timeaware_active_last_zone(
+                n=len(df),
+                created_idx=zones["created_idx"].values,
+                first_touch_idx=zones["first_touch_idx"].values,
+                top=zones["top"].values.astype(float, copy=False),
+                bottom=zones["bottom"].values.astype(float, copy=False),
+            )
+            top_s = pd.Series(last_top, index=df.index)
+            bot_s = pd.Series(last_bot, index=df.index)
             active_mask, in_mask = cmp_fn(top_s, bot_s, close)
-            df[active_col] = active_mask.fillna(False)
-            df.loc[in_mask.fillna(False), "in_ob"] = in_label
+            df[active_col] = (any_active & active_mask.fillna(False).values)
+            df.loc[in_mask.fillna(False).values, "in_ob"] = in_label
 
     return df
 

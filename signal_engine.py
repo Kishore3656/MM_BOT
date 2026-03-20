@@ -49,12 +49,22 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+try:
+    from risk_manager import ICTRiskManager
+except Exception:  # pragma: no cover
+    ICTRiskManager = None  # type: ignore[assignment]
+
 # ── Tunable parameters ────────────────────────────────────────────────────────
-KILL_ZONES:      frozenset[str] = frozenset({"london", "newyork"})
+KILL_ZONES:      frozenset[str] = frozenset({"london", "newyork", "nypm"})
 CHOCH_LOOKBACK:  int   = 10     # bars to look back for a directional CHoCH
-SL_ATR_BUFFER:   float = 0.10   # SL placed SL_ATR_BUFFER × atr14 beyond structure low/high
+SWEEP_LOOKBACK:  int   = 24     # bars to look back for a liquidity sweep (24 × 5m = 2 h)
+SL_ATR_BUFFER:   float = 0.50   # SL placed SL_ATR_BUFFER × atr14 beyond structure low/high
 DEFAULT_RR_MULT: float = 3.0    # fallback TP2 multiple when no liquidity level exists
 MIN_RR:          float = 2.0    # minimum RR to emit a signal
+MIN_CONDITIONS:  int   = 6      # out of 7 — 7 = full A+, 6 = one-condition grace
+MIN_RISK_ATR:    float = 1.5    # SL must be ≥ this × ATR from entry (filters near-zero risk)
+EMA_PERIOD:      int   = 50     # 4h EMA period for trend filter (~5 weeks, matches 60d execution window)
+TP1_RR:          float = 1.0    # TP1 at 1R — partial close locks in profit and activates BE
 
 CONDITION_NAMES: list[str] = [
     "c1_htf_bias",
@@ -67,7 +77,7 @@ CONDITION_NAMES: list[str] = [
 ]
 
 # ── Required columns per DataFrame ───────────────────────────────────────────
-_REQ_4H = ["structure"]
+_REQ_4H = ["structure", "close"]
 _REQ_5M = [
     "session",
     "structure", "last_structure_high", "last_structure_low", "choch",
@@ -101,6 +111,12 @@ def _align_htf(htf_df: pd.DataFrame,
     return sub.reindex(combined_idx).ffill().reindex(ltf_index)
 
 
+def _align_series(series: pd.Series, ltf_index: pd.DatetimeIndex) -> pd.Series:
+    """Forward-fill a single HTF Series onto a lower-timeframe index."""
+    combined_idx = series.index.union(ltf_index)
+    return series.reindex(combined_idx).ffill().reindex(ltf_index)
+
+
 def _get_mtf_frame(mtf_data: dict[str, pd.DataFrame], *keys: str) -> pd.DataFrame | None:
     """Return the first available timeframe DataFrame without using DataFrame truthiness."""
     for key in keys:
@@ -129,15 +145,21 @@ def _build_tp2(
     liq_target: pd.Series,
     direction: int,
 ) -> pd.Series:
-    """TP2 = opposite liquidity level if valid, else DEFAULT_RR_MULT × risk."""
+    """TP2 = opposite liquidity level if it provides ≥ MIN_RR, else DEFAULT_RR_MULT × risk.
+
+    Using a liquidity target that is too close (< MIN_RR) would cause the signal
+    to be filtered by the RR check. Falling back to the multiplier prevents this.
+    """
     fallback = (
         entry + DEFAULT_RR_MULT * risk if direction == 1
         else entry - DEFAULT_RR_MULT * risk
     )
     if direction == 1:
-        valid = liq_target.notna() & (liq_target > entry)
+        rr_from_liq = (liq_target - entry) / risk.clip(lower=1e-9)
+        valid = liq_target.notna() & (liq_target > entry) & (rr_from_liq >= MIN_RR)
     else:
-        valid = liq_target.notna() & (liq_target < entry)
+        rr_from_liq = (entry - liq_target) / risk.clip(lower=1e-9)
+        valid = liq_target.notna() & (liq_target < entry) & (rr_from_liq >= MIN_RR)
     return liq_target.where(valid, fallback)
 
 
@@ -147,8 +169,10 @@ def _build_tp2(
 
 def _build_conditions(
     df_5m: pd.DataFrame,
+    df_4h: pd.DataFrame,
     htf_structure: pd.Series,
     choch_lookback: int,
+    df_1h: "pd.DataFrame | None" = None,
 ) -> dict[str, tuple[pd.Series, pd.Series]]:
     """
     Compute all 7 boolean conditions for long and short.
@@ -158,22 +182,37 @@ def _build_conditions(
     """
     close = df_5m["close"]
 
-    # ── C1: HTF structural bias ───────────────────────────────────────────────
-    c1_long  = htf_structure == "bullish"
-    c1_short = htf_structure == "bearish"
+    # ── C1: HTF structural bias + EMA-50 trend filter + 1h confirmation ───────
+    # EMA-50 on 4h close: only take longs when price is above the 4h trend,
+    # shorts when below. This prevents trading against strong trends (e.g.,
+    # going long AAPL/ETH in a downtrend or shorting gold in a bull run).
+    ema50_4h     = df_4h["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+    close_4h_5m  = _align_series(df_4h["close"], df_5m.index)
+    ema50_5m     = _align_series(ema50_4h,        df_5m.index)
+
+    trend_bull = close_4h_5m > ema50_5m
+    trend_bear = close_4h_5m < ema50_5m
+
+    c1_long  = (htf_structure == "bullish") & trend_bull
+    c1_short = (htf_structure == "bearish") & trend_bear
 
     # ── C2: Active kill zone ──────────────────────────────────────────────────
     c2 = df_5m["session"].isin(KILL_ZONES)
 
-    # ── C3: Directional liquidity sweep ──────────────────────────────────────
-    sweep = df_5m["liquidity_sweep"].fillna(False)
-    c3_long  = sweep & (df_5m["sweep_dir"] == "ssl")   # sellside swept → bullish
-    c3_short = sweep & (df_5m["sweep_dir"] == "bsl")   # buyside  swept → bearish
+    # ── C3: Directional liquidity sweep (within lookback window) ─────────────
+    # A sweep triggers the setup but entry forms over the following bars.
+    # Rolling max over SWEEP_LOOKBACK keeps C3 True for up to 2 h after the
+    # sweep so that CHoCH (C4), OTE (C6) and PD-array (C7) have time to align.
+    sweep = df_5m["liquidity_sweep"].eq(True)
+    sweep_long  = (sweep & (df_5m["sweep_dir"] == "ssl")).astype(np.int8)
+    sweep_short = (sweep & (df_5m["sweep_dir"] == "bsl")).astype(np.int8)
+    c3_long  = sweep_long.rolling(SWEEP_LOOKBACK,  min_periods=1).max().astype(bool)
+    c3_short = sweep_short.rolling(SWEEP_LOOKBACK, min_periods=1).max().astype(bool)
 
     # ── C4: CHoCH in the correct direction within lookback window ─────────────
     # A bullish CHoCH = choch fired AND the previous bar was in bearish structure
     prev_struct = df_5m["structure"].shift(1).fillna("consolidation")
-    choch       = df_5m["choch"].fillna(False)
+    choch       = df_5m["choch"].eq(True)
 
     choch_bull = (choch & (prev_struct == "bearish")).astype(np.int8)
     choch_bear = (choch & (prev_struct == "bullish")).astype(np.int8)
@@ -183,8 +222,8 @@ def _build_conditions(
     c4_short = choch_bear.rolling(window, min_periods=1).max().astype(bool)
 
     # ── C5: Price zone alignment ──────────────────────────────────────────────
-    c5_long  = df_5m["discount"].fillna(False).astype(bool)
-    c5_short = df_5m["premium"].fillna(False).astype(bool)
+    c5_long  = df_5m["discount"].eq(True)
+    c5_short = df_5m["premium"].eq(True)
 
     # ── C6: Price inside OTE band ─────────────────────────────────────────────
     c6_long  = (close >= df_5m["ote_low"])       & (close <= df_5m["ote_high"])
@@ -193,10 +232,10 @@ def _build_conditions(
     c6_short = c6_short.fillna(False)
 
     # ── C7: Active PD array at current price ─────────────────────────────────
-    c7_long  = (df_5m["fvg_bull_active"].fillna(False) |
-                df_5m["ob_bull_active"].fillna(False))
-    c7_short = (df_5m["fvg_bear_active"].fillna(False) |
-                df_5m["ob_bear_active"].fillna(False))
+    c7_long  = (df_5m["fvg_bull_active"].eq(True) |
+                df_5m["ob_bull_active"].eq(True))
+    c7_short = (df_5m["fvg_bear_active"].eq(True) |
+                df_5m["ob_bear_active"].eq(True))
 
     return {
         "c1_htf_bias":  (c1_long,  c1_short),
@@ -217,16 +256,19 @@ def generate_signals(
     mtf_data: dict[str, pd.DataFrame],
     min_rr: float = MIN_RR,
     choch_lookback: int = CHOCH_LOOKBACK,
+    min_conditions: int = MIN_CONDITIONS,
+    min_risk_atr: float = MIN_RISK_ATR,
 ) -> pd.DataFrame:
     """
-    Scan all 5M bars and return every A+ signal that meets all 7 conditions
-    and a minimum RR ratio.
+    Scan all 5M bars and return every signal that meets `min_conditions` out of
+    7 ICT conditions and a minimum RR ratio.
 
     Parameters
     ----------
-    mtf_data      : fully-enriched dict {"4h": df_4h, "5m": df_5m, ...}
-    min_rr        : minimum risk-reward ratio to emit (default 2.0)
-    choch_lookback: bars to look back for a directional CHoCH (default 10)
+    mtf_data       : fully-enriched dict {"4h": df_4h, "5m": df_5m, ...}
+    min_rr         : minimum risk-reward ratio to emit (default 2.0)
+    choch_lookback : bars to look back for a directional CHoCH (default 10)
+    min_conditions : conditions required out of 7 (default 6; use 7 for strict A+)
 
     Returns
     -------
@@ -236,6 +278,7 @@ def generate_signals(
         c1_htf_bias … c7_pd_array
     """
     df_4h = _get_mtf_frame(mtf_data, "4h", "4H")
+    df_1h = _get_mtf_frame(mtf_data, "1h", "1H")
     df_5m = _get_mtf_frame(mtf_data, "5m", "5M")
 
     if df_4h is None:
@@ -250,14 +293,14 @@ def generate_signals(
     htf_structure = _align_htf(df_4h, df_5m.index, ["structure"])["structure"]
 
     # Compute all conditions
-    conds = _build_conditions(df_5m, htf_structure, choch_lookback)
+    conds = _build_conditions(df_5m, df_4h, htf_structure, choch_lookback, df_1h)
 
     # Score each direction
     long_scores  = sum(conds[n][0].astype(np.int8) for n in CONDITION_NAMES)
     short_scores = sum(conds[n][1].astype(np.int8) for n in CONDITION_NAMES)
 
-    long_signal  = long_scores  == 7
-    short_signal = short_scores == 7
+    long_signal  = long_scores  >= min_conditions
+    short_signal = short_scores >= min_conditions
     any_signal   = long_signal | short_signal
 
     if not any_signal.any():
@@ -276,8 +319,8 @@ def generate_signals(
     risk_long  = (close - sl_long).clip(lower=1e-9)
     risk_short = (sl_short - close).clip(lower=1e-9)
 
-    tp1_long  = close + risk_long
-    tp1_short = close - risk_short
+    tp1_long  = close + TP1_RR * risk_long
+    tp1_short = close - TP1_RR * risk_short
 
     tp2_long  = _build_tp2(close, risk_long,  df_5m["bsl_level"],  1)
     tp2_short = _build_tp2(close, risk_short, df_5m["ssl_level"], -1)
@@ -285,9 +328,10 @@ def generate_signals(
     rr_long  = (tp2_long  - close) / risk_long
     rr_short = (close - tp2_short) / risk_short
 
-    # Apply RR filter
-    long_valid  = long_signal  & (rr_long  >= min_rr)
-    short_valid = short_signal & (rr_short >= min_rr)
+    # Apply RR + minimum risk filters
+    min_risk = df_5m["atr14"] * min_risk_atr
+    long_valid  = long_signal  & (rr_long  >= min_rr) & (risk_long  >= min_risk)
+    short_valid = short_signal & (rr_short >= min_rr) & (risk_short >= min_risk)
 
     # Long takes priority if both fire on the same bar (rare)
     direction = pd.Series(0, index=df_5m.index, dtype=np.int8)
@@ -364,6 +408,10 @@ def score_signal(
     idx: int = -1,
     min_rr: float = MIN_RR,
     choch_lookback: int = CHOCH_LOOKBACK,
+    min_conditions: int = MIN_CONDITIONS,
+    risk_manager: "ICTRiskManager | None" = None,
+    equity: float | None = None,
+    open_positions: list[dict[str, Any]] | int = 0,
 ) -> dict[str, Any]:
     """
     Evaluate the ICT A+ conditions for a single bar (default: last bar).
@@ -380,6 +428,7 @@ def score_signal(
                     rr_ratio, kill_zone, confluence, bar_time, c1..c7
     """
     df_4h = _get_mtf_frame(mtf_data, "4h", "4H")
+    df_1h = _get_mtf_frame(mtf_data, "1h", "1H")
     df_5m = _get_mtf_frame(mtf_data, "5m", "5M")
 
     _check_cols(df_4h, _REQ_4H, "4h")
@@ -388,7 +437,7 @@ def score_signal(
     bar_time = df_5m.index[idx]
 
     htf_structure = _align_htf(df_4h, df_5m.index, ["structure"])["structure"]
-    conds = _build_conditions(df_5m, htf_structure, choch_lookback)
+    conds = _build_conditions(df_5m, df_4h, htf_structure, choch_lookback, df_1h)
 
     # Evaluate at the target bar
     row: dict[str, bool] = {
@@ -404,11 +453,11 @@ def score_signal(
     short_score = sum(row["short"].values())
 
     # Determine direction
-    if long_score == 7:
+    if long_score >= min_conditions and long_score >= short_score:
         direction = 1
         score     = long_score
         cond_dict = row["long"]
-    elif short_score == 7:
+    elif short_score >= min_conditions:
         direction = -1
         score     = short_score
         cond_dict = row["short"]
@@ -430,14 +479,14 @@ def score_signal(
     if direction >= 0:   # long or undecided
         sl     = max(float(df_5m["last_structure_low"].iloc[idx])  - buf, 0.0)
         risk   = max(close - sl, 1e-9)
-        tp1    = close + risk
+        tp1    = close + TP1_RR * risk
         liq    = df_5m["bsl_level"].iloc[idx]
         tp2    = float(liq) if pd.notna(liq) and float(liq) > close else close + DEFAULT_RR_MULT * risk
         rr     = (tp2 - close) / risk
     else:                # short
         sl     = float(df_5m["last_structure_high"].iloc[idx]) + buf
         risk   = max(sl - close, 1e-9)
-        tp1    = close - risk
+        tp1    = close - TP1_RR * risk
         liq    = df_5m["ssl_level"].iloc[idx]
         tp2    = float(liq) if pd.notna(liq) and float(liq) < close else close - DEFAULT_RR_MULT * risk
         rr     = (close - tp2) / risk
@@ -447,7 +496,7 @@ def score_signal(
 
     confluence = [n for n, v in cond_dict.items() if v]
 
-    return {
+    result: dict[str, Any] = {
         "signal":          direction,
         "conditions_met":  score,
         "entry_price":     round(close, 5),
@@ -460,6 +509,51 @@ def score_signal(
         "bar_time":        bar_time,
         **{n: v for n, v in cond_dict.items()},
     }
+
+    # ── Risk manager gate (live execution should only act if approved) ────────
+    if risk_manager is not None and equity is not None:
+        approved, reason = risk_manager.approve_trade(result, equity=float(equity), open_positions=open_positions)
+        result["approved"] = bool(approved)
+        result["approve_reason"] = str(reason)
+        if approved:
+            units = risk_manager.compute_position_size(
+                equity=float(equity),
+                entry=float(result["entry_price"]),
+                stop_loss=float(result["stop_loss"]),
+            )
+            result["position_units"] = float(units)
+        else:
+            # Block execution by zeroing the signal
+            result["signal"] = 0
+
+    return result
+
+
+def get_signal(
+    mtf_data: dict[str, pd.DataFrame],
+    *,
+    equity: float | None = None,
+    open_positions: list[dict[str, Any]] | int = 0,
+    risk_manager: "ICTRiskManager | None" = None,
+    idx: int = -1,
+    min_rr: float = MIN_RR,
+    choch_lookback: int = CHOCH_LOOKBACK,
+    min_conditions: int = MIN_CONDITIONS,
+) -> dict[str, Any]:
+    """
+    Convenience wrapper for live bots.
+    Returns the score_signal() dict for the requested bar (default: last bar).
+    """
+    return score_signal(
+        mtf_data,
+        idx=idx,
+        min_rr=min_rr,
+        choch_lookback=choch_lookback,
+        min_conditions=min_conditions,
+        risk_manager=risk_manager,
+        equity=equity,
+        open_positions=open_positions,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

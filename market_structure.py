@@ -56,12 +56,21 @@ def find_pivots(df: pd.DataFrame, n: int = 5) -> pd.DataFrame:
     pivot_high : price at the pivot high, NaN elsewhere
     pivot_low  : price at the pivot low,  NaN elsewhere
     """
-    if not _HAS_SCIPY:
-        raise ImportError("scipy is required for pivot detection.")
-
     df = df.copy()
     high = df["high"].values
     low  = df["low"].values
+
+    # Fallback when SciPy is unavailable: rolling-window local extrema proxy.
+    # This preserves the rest of the market-structure pipeline so live/paper
+    # runs can work without SciPy installed.
+    if not _HAS_SCIPY:
+        win = max(int(2 * n + 1), 3)
+        roll_high = df["high"].rolling(win, center=True, min_periods=n + 1).max()
+        roll_low = df["low"].rolling(win, center=True, min_periods=n + 1).min()
+
+        df["pivot_high"] = np.where(df["high"].values == roll_high.values, df["high"].values, np.nan)
+        df["pivot_low"] = np.where(df["low"].values == roll_low.values, df["low"].values, np.nan)
+        return df
 
     ph_idx = argrelmax(high, order=n)[0]
     pl_idx = argrelmin(low,  order=n)[0]

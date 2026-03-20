@@ -1,0 +1,46 @@
+# ============================================================
+# ICT Trading Bot — requirements.txt
+# Python >= 3.10 recommended
+# ============================================================
+
+# --- Core Data & Numerics (all modules) ---
+pandas>=2.1.0
+numpy>=1.26.0
+
+# --- Module 1: data_feed.py ---
+ccxt>=4.3.0                   # crypto exchange API (Binance, Bybit, OKX, etc.)
+oandapyV20>=0.6.3             # Forex via OANDA REST API
+yfinance>=0.2.40              # free data for stocks, forex, commodities, indices
+
+# --- Modules 2–5: market_structure, dealing_range, liquidity, pd_arrays ---
+# pandas-ta removed: requires numba which does not yet support Python 3.14
+# ATR and swing indicators are computed inline with pandas/numpy in pd_arrays.py
+scipy>=1.12.0                 # argrelmax/argrelmin for pivot detection
+
+# --- Module 6: signal_engine.py ---
+# (pure pandas logic — no extra deps)
+
+# --- Module 7: backtest.py ---
+matplotlib>=3.8.0             # equity curve + monthly heatmap plots
+seaborn>=0.13.0               # heatmap styling
+
+# --- Module 8: risk_manager.py ---
+# (pure Python stdlib + pandas — no extra deps)
+
+# --- Module 9: bot.py (live execution) ---
+APScheduler>=3.10.4           # cron-style 5M candle scheduling
+python-telegram-bot>=20.7     # Telegram trade alerts (optional)
+python-dotenv>=1.0.0          # load API keys from .env file
+requests>=2.31.0              # REST fallbacks / webhook pings
+
+# --- Module 10: llm_filter.py ---
+anthropic>=0.28.0             # Claude API (claude-sonnet-4-20250514)
+
+# --- Logging & Utilities ---
+loguru>=0.7.2                 # cleaner logging vs stdlib (optional but recommended)
+pytz>=2024.1                  # kill zone UTC→EST timezone conversion
+tqdm>=4.66.0                  # progress bars during backtesting
+
+# --- Dev / Testing (optional, not needed in prod) ---
+pytest>=8.0.0
+ipykernel>=6.29.0             # Jupyter notebook support for exploration
