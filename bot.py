@@ -38,7 +38,15 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
+
+try:
+    import yaml as _yaml
+    _HAS_YAML = True
+except ImportError:
+    _yaml = None  # type: ignore
+    _HAS_YAML = False
 
 import pandas as pd
 
@@ -51,11 +59,13 @@ except Exception:
     CronTrigger = None          # type: ignore
     _HAS_APSCHEDULER = False
 
+import data_feed as _data_feed
 from data_feed import fetch_mtf, _add_swings, _add_session_column
 from market_structure import add_market_structure
 from dealing_range import compute_dealing_range
 from liquidity import add_liquidity, detect_sweeps, detect_judas_swing
 from pd_arrays import add_pd_arrays
+import signal_engine as _signal_engine
 from signal_engine import get_signal, MIN_CONDITIONS
 from risk_manager import ICTRiskManager
 
@@ -111,6 +121,126 @@ def _setup_logger(log_path: str = "bot.log") -> logging.Logger:
     sh.setFormatter(fmt)
     logger.addHandler(sh)
     return logger
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  YAML config loader
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_config(path: str) -> dict:
+    """Load config.yaml and return as a nested dict. Returns {} if not found."""
+    if not _HAS_YAML:
+        raise ImportError(
+            "PyYAML is required for --config. Install it: pip install pyyaml")
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config file not found: {p.resolve()}")
+    with p.open("r", encoding="utf-8") as f:
+        return _yaml.safe_load(f) or {}
+
+
+def _apply_config(cfg: dict, args: argparse.Namespace) -> None:
+    """
+    Apply loaded YAML config to:
+      1. CLI args namespace (bot section — only if CLI flag was not set explicitly)
+      2. signal_engine module globals
+      3. data_feed module globals
+    Risk settings are applied separately via _build_risk().
+    """
+    bot_cfg  = cfg.get("bot",    {}) or {}
+    sig_cfg  = cfg.get("signal", {}) or {}
+    data_cfg = cfg.get("data",   {}) or {}
+
+    # ── Bot / CLI defaults (config fills in, explicit CLI flags win) ──────────
+    # argparse sets defaults; we only override where the user hasn't passed a flag.
+    # We compare against argparse defaults to detect explicit CLI overrides.
+    _bot_defaults = {
+        "symbol":       None,
+        "source":       "ccxt",
+        "exchange_id":  "binance",
+        "exec_tf":      "auto",
+        "paper":        False,
+        "paper_equity": 10_000.0,
+        "log":          "bot.log",
+        "local_dir":    "gold_clean_data",
+        "local_prefix": "XAU",
+        "telegram":     False,
+    }
+    for attr, default in _bot_defaults.items():
+        yaml_key = attr.replace("_", "-") if "-" in attr else attr
+        # Use the underscore version for both lookups
+        yaml_val = bot_cfg.get(attr) if attr in bot_cfg else bot_cfg.get(attr.replace("_", "-"))
+        if yaml_val is None:
+            continue
+        current = getattr(args, attr, default)
+        if current == default:           # CLI not explicitly set → apply yaml
+            setattr(args, attr, yaml_val)
+
+    # Telegram enabled flag from config
+    tg_cfg = cfg.get("telegram", {}) or {}
+    if tg_cfg.get("enabled") and not args.telegram:
+        args.telegram = True
+
+    # ── signal_engine globals ─────────────────────────────────────────────────
+    _se = _signal_engine
+    _map_se = {
+        "min_conditions": "MIN_CONDITIONS",
+        "min_rr":         "MIN_RR",
+        "sl_atr_buffer":  "SL_ATR_BUFFER",
+        "default_rr_mult":"DEFAULT_RR_MULT",
+        "min_risk_atr":   "MIN_RISK_ATR",
+        "ema_period":     "EMA_PERIOD",
+        "tp1_rr":         "TP1_RR",
+        "choch_lookback": "CHOCH_LOOKBACK",
+        "sweep_lookback": "SWEEP_LOOKBACK",
+    }
+    for yaml_key, module_attr in _map_se.items():
+        if yaml_key in sig_cfg:
+            setattr(_se, module_attr, type(getattr(_se, module_attr))(sig_cfg[yaml_key]))
+
+    # ── data_feed globals ─────────────────────────────────────────────────────
+    _df = _data_feed
+    bars = (data_cfg.get("bars") or {})
+    for tf in ("4h", "1h", "5m"):
+        if tf in bars:
+            _df.LIMIT[tf] = int(bars[tf])
+
+    swing = (data_cfg.get("swing_n") or {})
+    for tf in ("4h", "1h", "5m"):
+        if tf in swing:
+            _df.SWING_N[tf] = int(swing[tf])
+
+    sessions = (data_cfg.get("sessions") or {})
+    if sessions:
+        new_sessions = []
+        for name, val in sessions.items():
+            if isinstance(val, (list, tuple)) and len(val) == 2:
+                # Simple form: london: [7.0, 10.0]
+                new_sessions.append((name, float(val[0]), float(val[1])))
+            elif isinstance(val, dict):
+                # Rich form: london: {enabled: true, hours: [7.0, 10.0]}
+                if not val.get("enabled", True):
+                    continue   # skip disabled sessions
+                hours = val.get("hours")
+                if hours and len(hours) == 2:
+                    new_sessions.append((name, float(hours[0]), float(hours[1])))
+        if new_sessions:
+            _df.SESSIONS = new_sessions
+            # Also update signal_engine's KILL_ZONES to match active sessions
+            _signal_engine.KILL_ZONES = frozenset(s[0] for s in new_sessions)
+
+
+def _build_risk(cfg: dict) -> ICTRiskManager:
+    """Build ICTRiskManager from the [risk] section of the config."""
+    rc = cfg.get("risk", {}) or {}
+    return ICTRiskManager(
+        max_risk_per_trade=float(rc.get("max_risk_per_trade", 0.01)),
+        max_daily_loss=float(rc.get("max_daily_loss", 0.03)),
+        max_drawdown=float(rc.get("max_drawdown", 0.10)),
+        max_concurrent_positions=int(rc.get("max_concurrent_positions", 2)),
+        min_rr_ratio=float(rc.get("min_rr_ratio", 2.0)),
+        kill_zone_only=bool(rc.get("kill_zone_only", True)),
+    )
 
 
 def _floor_to_5m(ts: datetime) -> datetime:
@@ -456,6 +586,7 @@ class ICTLiveBot:
         exec_tf: str = "auto",  # "auto" | "5m" | "1h"
         local_dir: str = "gold_clean_data",
         local_prefix: str = "XAU",
+        exchange_id: str = "binance",
     ):
         self.symbol       = symbol
         self.source       = source
@@ -465,7 +596,11 @@ class ICTLiveBot:
         self.exec_tf      = exec_tf
         self.local_dir    = local_dir
         self.local_prefix = local_prefix
+        self.exchange_id  = exchange_id
         self.notifier: TelegramNotifier | None = None
+
+        # Read-only ccxt exchange for paper+ccxt data (no API keys needed)
+        self._public_ccxt_exchange = None
 
         self.positions:      list[Position]     = []
         self.pending_orders: list[PendingOrder] = []
@@ -482,11 +617,34 @@ class ICTLiveBot:
             return self.exec_tf
         return "5m" if self.source == "ccxt" else "1h"
 
+    def _get_data_exchange(self):
+        """
+        Return the exchange object used for market data.
+        Live brokers (CCXTBroker, OandaBroker) expose get_data_client().
+        Paper mode with ccxt source needs a public (no-auth) ccxt exchange.
+        """
+        client = self.broker.get_data_client()
+        if client is not None:
+            return client
+        if self.source == "ccxt" and ccxt is not None:
+            if self._public_ccxt_exchange is None:
+                ex_cls = getattr(ccxt, self.exchange_id, None)
+                if ex_cls is None:
+                    raise ValueError(
+                        f"Unknown ccxt exchange id '{self.exchange_id}'. "
+                        "Check --exchange-id (e.g. binance, bybit, okx)."
+                    )
+                self._public_ccxt_exchange = ex_cls({"enableRateLimit": True})
+                self.logger.info(
+                    f"[data] paper mode: using public {self.exchange_id} exchange for market data")
+            return self._public_ccxt_exchange
+        return None
+
     def _fetch_raw_mtf(self) -> dict[str, pd.DataFrame]:
         """Fetch raw multi-timeframe OHLCV (unenriched)."""
         if self.source == "yfinance":
             return _fetch_yfinance_mtf(self.symbol)
-        exchange = None if self.source == "local" else self.broker.get_data_client()
+        exchange = None if self.source == "local" else self._get_data_exchange()
         return fetch_mtf(
             self.symbol, exchange,
             source=self.source,
@@ -817,6 +975,12 @@ Examples
   # Paper trade EUR/USD (yfinance, 1h exec)
   python bot.py --symbol EURUSD=X --source yfinance --paper
 
+  # Load settings from config.yaml (CLI flags override file)
+  python bot.py --config config.yaml
+
+  # Config + override symbol on CLI
+  python bot.py --config config.yaml --symbol ETH/USDT
+
   # Live ccxt + Telegram alerts
   python bot.py --symbol BTC/USDT --source ccxt --telegram
 
@@ -831,7 +995,9 @@ Sources
   local     — Offline CSV (backtest-only, paper mode)
 """,
     )
-    ap.add_argument("--symbol",         required=True,
+    ap.add_argument("--config",         default=None,
+                    help="path to config.yaml (e.g. config.yaml). CLI flags override file values.")
+    ap.add_argument("--symbol",         default=None,
                     help="e.g. BTC/USDT (ccxt) | EURUSD=X (yfinance) | EUR_USD (oanda)")
     ap.add_argument("--source",         default="ccxt",
                     choices=["ccxt", "oanda", "yfinance", "local"],
@@ -860,14 +1026,25 @@ Sources
                     help="attempt generic ccxt bracket orders (exchange-specific, use with caution)")
     args = ap.parse_args()
 
+    # ── Load YAML config (before anything else so args get patched) ───────────
+    cfg: dict = {}
+    if args.config:
+        cfg = _load_config(args.config)
+        _apply_config(cfg, args)
+
+    # symbol is required — either from CLI or config
+    if not args.symbol:
+        ap.error("--symbol is required (or set bot.symbol in config.yaml)")
+
     logger = _setup_logger(args.log)
     pd.set_option("future.no_silent_downcasting", True)
     logger.info(
         f"[boot] symbol={args.symbol} source={args.source} "
-        f"exec_tf={args.exec_tf} paper={args.paper}")
+        f"exec_tf={args.exec_tf} paper={args.paper}"
+        + (f" config={args.config}" if args.config else ""))
 
     broker = _build_broker(args, logger)
-    risk   = ICTRiskManager()
+    risk   = _build_risk(cfg) if cfg else ICTRiskManager()
 
     bot = ICTLiveBot(
         symbol=args.symbol,
@@ -878,6 +1055,7 @@ Sources
         exec_tf=args.exec_tf,
         local_dir=args.local_dir,
         local_prefix=args.local_prefix,
+        exchange_id=args.exchange_id,
     )
 
     if args.telegram:

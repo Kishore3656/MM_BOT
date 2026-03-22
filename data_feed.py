@@ -207,6 +207,7 @@ def _fetch_local(tf: str, local_dir: str, local_prefix: str) -> pd.DataFrame:
         Path(local_dir) / f"{local_prefix}_{suffix}_data_clean.csv",
         Path(local_dir) / f"{local_prefix}_{suffix}.csv",
         Path(local_dir) / f"{local_prefix.lower()}_{suffix}.csv",
+        Path(local_dir) / f"{local_prefix}_{suffix}_clean.csv",
     ]
     path: Optional[Path] = None
     for c in candidates:

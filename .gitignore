@@ -1,9 +1,10 @@
 # Ignore locally generated cleaned data
 gold_clean_data/
-
+nasdaq/
+backtest_data/
 # Python virtual environment
 .venv/
-
+.
 # Python bytecode caches
 __pycache__/
 *.pyc

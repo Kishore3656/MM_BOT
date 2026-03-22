@@ -32,6 +32,7 @@ APScheduler>=3.10.4           # cron-style 5M candle scheduling
 python-telegram-bot>=20.7     # Telegram trade alerts (optional)
 python-dotenv>=1.0.0          # load API keys from .env file
 requests>=2.31.0              # REST fallbacks / webhook pings
+pyyaml>=6.0.1                 # config.yaml support
 
 # --- Module 10: llm_filter.py ---
 anthropic>=0.28.0             # Claude API (claude-sonnet-4-20250514)

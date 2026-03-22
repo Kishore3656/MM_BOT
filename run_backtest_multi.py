@@ -448,7 +448,10 @@ def _forward_fill_htf_onto_exec(df_htf: pd.DataFrame, df_exec: pd.DataFrame) -> 
 
 
 def run_asset(symbol: str, instrument: str, initial_equity: float, plot: bool,
-              exec_tf: str = "auto") -> dict:
+              exec_tf: str = "auto",
+              override_source: str | None = None,
+              override_local_dir: str | None = None,
+              override_local_prefix: str | None = None) -> dict:
     """
     Full pipeline for one asset.
 
@@ -456,6 +459,9 @@ def run_asset(symbol: str, instrument: str, initial_equity: float, plot: bool,
         "5m"  — use 5m bars as execution frame (best for crypto with deep history)
         "1h"  — use 1h bars as execution frame (best for yfinance assets capped at 60d 5m)
         "auto" — "5m" for ccxt sources, "1h" for yfinance sources (default)
+    override_source      : if set, overrides the registry source (e.g. "local")
+    override_local_dir   : local CSV directory (used when override_source="local")
+    override_local_prefix: local CSV filename prefix (used when override_source="local")
     """
     from data_feed import fetch_mtf
     from market_structure import add_market_structure
@@ -465,10 +471,10 @@ def run_asset(symbol: str, instrument: str, initial_equity: float, plot: bool,
     from signal_engine import generate_signals
     from backtest import full_wf_report
 
-    prefix = _symbol_to_prefix(symbol)
+    prefix = override_local_prefix or _symbol_to_prefix(symbol)
     meta = _get_meta(symbol)
     asset_class = meta.get("class", "unknown")
-    source = meta.get("source", "ccxt")
+    source = override_source or meta.get("source", "ccxt")
 
     # Resolve execution timeframe
     if exec_tf == "auto":
@@ -481,11 +487,12 @@ def run_asset(symbol: str, instrument: str, initial_equity: float, plot: bool,
     print(f"{'─'*60}")
 
     # 1. Load MTF data from local CSVs
+    local_dir = override_local_dir or str(DATA_DIR)
     try:
         mtf = fetch_mtf(
             symbol,
             source="local",
-            local_dir=str(DATA_DIR),
+            local_dir=local_dir,
             local_prefix=prefix,
         )
     except FileNotFoundError as e:
@@ -521,8 +528,18 @@ def run_asset(symbol: str, instrument: str, initial_equity: float, plot: bool,
     # 4. Generate signals
     # For 1h exec: relax min_risk_atr (stop distance filter) because 1h ATR is
     # much larger than 5m ATR — tight stops are natural, not a degenerate case.
-    sig_min_risk_atr = 0.5 if effective_exec_tf == "1h" else 1.5
-    signals = generate_signals(enriched, min_risk_atr=sig_min_risk_atr)
+    # Use signal_engine globals (which may have been overridden by --config).
+    import signal_engine as _se_module
+    sig_min_risk_atr = _se_module.MIN_RISK_ATR if effective_exec_tf != "1h" else min(
+        _se_module.MIN_RISK_ATR, 0.5
+    )
+    signals = generate_signals(
+        enriched,
+        min_risk_atr=sig_min_risk_atr,
+        min_rr=_se_module.MIN_RR,
+        choch_lookback=_se_module.CHOCH_LOOKBACK,
+        min_conditions=_se_module.MIN_CONDITIONS,
+    )
     print(f"  Signals generated: {len(signals)}  "
           f"(long={int((signals['signal']==1).sum()) if not signals.empty else 0}, "
           f"short={int((signals['signal']==-1).sum()) if not signals.empty else 0})")
@@ -636,7 +653,7 @@ Registered symbols by class
                     help="Starting equity for backtest (default: 10000)")
     ap.add_argument(
         "--instrument", default=None,
-        choices=["crypto", "forex", "stock", "commodity", "index"],
+        choices=["crypto", "forex", "stock", "commodity", "index", "futures", "fin_futures"],
         help="Override cost model for all assets (default: per-asset from registry)",
     )
     ap.add_argument("--no-plot", action="store_true",
@@ -648,10 +665,59 @@ Registered symbols by class
         choices=["5m", "1h", "auto"],
         help="Execution timeframe: '5m' (crypto default), '1h' (yfinance default), 'auto'",
     )
+    ap.add_argument(
+        "--symbol", default=None,
+        help="Single symbol to backtest using local data (e.g. NQ/USD). Overrides --assets.",
+    )
+    ap.add_argument(
+        "--source", default=None,
+        help="Override data source for --symbol (e.g. 'local')",
+    )
+    ap.add_argument(
+        "--local-dir", dest="local_dir", default=None,
+        help="Local CSV directory when --source local is used (e.g. nasdaq)",
+    )
+    ap.add_argument(
+        "--local-prefix", dest="local_prefix", default=None,
+        help="Local CSV filename prefix when --source local is used (e.g. nasdaq)",
+    )
+    ap.add_argument(
+        "--config", default=None,
+        help="Path to config.yaml — loads signal/risk parameters from file",
+    )
     args = ap.parse_args()
 
+    # ── Apply config.yaml parameters to signal_engine globals (if provided) ──
+    if args.config:
+        try:
+            import yaml as _yaml
+            with open(args.config, "r", encoding="utf-8") as _f:
+                _cfg = _yaml.safe_load(_f) or {}
+            import signal_engine as _se
+            sig_cfg = _cfg.get("signal", {}) or {}
+            _map_se = {
+                "min_conditions": "MIN_CONDITIONS",
+                "min_rr":         "MIN_RR",
+                "sl_atr_buffer":  "SL_ATR_BUFFER",
+                "default_rr_mult":"DEFAULT_RR_MULT",
+                "min_risk_atr":   "MIN_RISK_ATR",
+                "ema_period":     "EMA_PERIOD",
+                "tp1_rr":         "TP1_RR",
+                "choch_lookback": "CHOCH_LOOKBACK",
+                "sweep_lookback": "SWEEP_LOOKBACK",
+            }
+            for yaml_key, module_attr in _map_se.items():
+                if yaml_key in sig_cfg:
+                    current = getattr(_se, module_attr)
+                    setattr(_se, module_attr, type(current)(sig_cfg[yaml_key]))
+                    print(f"  [config] {module_attr} = {getattr(_se, module_attr)}")
+        except Exception as _e:
+            print(f"  [config] WARNING: could not load {args.config}: {_e}")
+
     # ── Resolve asset list ────────────────────────────────────────────────────
-    if args.assets:
+    if args.symbol:
+        target_symbols = [args.symbol]
+    elif args.assets:
         target_symbols = args.assets
     elif args.asset_classes:
         target_symbols = [
@@ -665,9 +731,12 @@ Registered symbols by class
         print("No assets selected. Use --assets or --class to specify assets.")
         sys.exit(1)
 
+    # ── If using --symbol with --source local, skip download entirely ────────
+    use_local_override = bool(args.symbol and args.source == "local")
+
     # ── Connect to ccxt exchange (needed for crypto only) ─────────────────────
     exchange = None
-    has_crypto = any(
+    has_crypto = (not use_local_override) and any(
         _get_meta(s)["source"] == "ccxt" for s in target_symbols
     )
     if has_crypto:
@@ -686,7 +755,7 @@ Registered symbols by class
         print(f"\nConnected to {args.exchange.upper()} (crypto)")
 
     # Check yfinance is available for non-crypto assets
-    has_yfinance_assets = any(
+    has_yfinance_assets = (not use_local_override) and any(
         _get_meta(s)["source"] == "yfinance" for s in target_symbols
     )
     if has_yfinance_assets:
@@ -698,29 +767,40 @@ Registered symbols by class
 
     print(f"\nAssets to test ({len(target_symbols)}): {target_symbols}\n")
 
-    # ── Download data ─────────────────────────────────────────────────────────
-    print("=" * 60)
-    print("  DOWNLOADING HISTORICAL DATA")
-    print("=" * 60)
+    # ── Download data (skip when using local override) ────────────────────────
+    if use_local_override:
+        print("  [local override] Skipping download — using local CSV data.")
+        available = list(target_symbols)
+    else:
+        print("=" * 60)
+        print("  DOWNLOADING HISTORICAL DATA")
+        print("=" * 60)
 
-    available = []
-    for sym in target_symbols:
-        ok = download_asset(sym, exchange, args.bars, args.bars_5m, force=args.force_download)
-        if ok:
-            available.append(sym)
+        available = []
+        for sym in target_symbols:
+            ok = download_asset(sym, exchange, args.bars, args.bars_5m, force=args.force_download)
+            if ok:
+                available.append(sym)
 
-    if not available:
-        print("\nNo data downloaded. Exiting.")
-        sys.exit(1)
+        if not available:
+            print("\nNo data downloaded. Exiting.")
+            sys.exit(1)
 
     print(f"\nReady to backtest: {available}")
 
     # ── Run backtests ─────────────────────────────────────────────────────────
     results: dict[str, dict] = {}
     for sym in available:
-        instrument = args.instrument or _get_meta(sym)["instrument"]
+        instrument = args.instrument or _get_meta(sym).get("instrument", "futures")
         try:
-            res = run_asset(sym, instrument, args.equity, plot=not args.no_plot, exec_tf=args.exec_tf)
+            res = run_asset(
+                sym, instrument, args.equity,
+                plot=not args.no_plot,
+                exec_tf=args.exec_tf,
+                override_source=args.source if use_local_override else None,
+                override_local_dir=args.local_dir if use_local_override else None,
+                override_local_prefix=args.local_prefix if use_local_override else None,
+            )
             results[sym] = res
         except Exception as e:
             print(f"  [{sym}] FATAL: {e}")

@@ -1,0 +1,113 @@
+# ============================================================
+# ICT Trading Bot — Configuration
+# ============================================================
+# Edit this file to change any bot setting.
+# Run with: python bot.py --config config.yaml
+#
+# CLI flags (--symbol, --paper, etc.) always override this file.
+# API keys go in .env (never here).
+# ============================================================
+#
+# ── NASDAQ-TUNED PARAMETERS (NQ/USD, tuned 2026-03-22) ──────
+#
+# Tuned for E-mini Nasdaq 100 futures (NQ/USD local CSV data,
+# 2016-2025 backtest on 1h execution timeframe).
+#
+# Parameter sweep results (15 combinations × 2 sweeps = 30+ runs):
+#   BEST quality config (selected):
+#     min_conditions=6, sweep_lookback=12, sl_atr_buffer=1.0
+#     WR=55%, PF=1.856, Sharpe=0.305, MaxDD=-6.16%, Return=+7.85%
+#     OOS Sharpe=0.62 > IS Sharpe=0.16 — no overfitting
+#     Trades: 20 over 9 years (~2/year, high-conviction only)
+#
+# Key changes from defaults:
+#   min_conditions: 6 (unchanged) — strict A+ setup required
+#   sweep_lookback: 12 (reduced from 24) — NASDAQ moves fast
+#   choch_lookback: 8 (reduced from 10) — tighter structure
+#   sl_atr_buffer: 1.0 (raised from 0.50) — NASDAQ is volatile,
+#     needs more room; this is the single biggest performance driver
+#   tp1_rr: 1.5 (raised from 1.0) — let partial profits run further
+#   default_rr_mult: 3.5 (raised from 3.0) — NASDAQ trends strongly
+#   min_rr: 2.0 (unchanged) — sweep showed 2.0 better than 2.5 here
+#   min_risk_atr: 1.0 (reduced from 1.5) — 1h bars already large
+#   ema_period: 50 (unchanged)
+#
+# Session performance breakdown:
+#   NY PM (nypm): Best session — 63.6% WR, +$790 PnL
+#   London: Decent — 50% WR, positive PnL
+#   NY Regular: Weakest — 42.9% WR
+# ============================================================
+
+# ── Bot / Execution ───────────────────────────────────────
+bot:
+  symbol: NQ/USD             # Trading pair
+                             #   ccxt  : BTC/USDT, ETH/USDT, …
+                             #   oanda : EUR_USD, XAU_USD, …
+                             #   yfinance: EURUSD=X, GC=F, ^GSPC
+  source: local              # ccxt | oanda | yfinance | local
+  exchange_id: binance       # ccxt exchange (binance, bybit, okx, …)
+  exec_tf: auto              # auto | 5m | 1h
+                             #   auto → 5m for ccxt/oanda, 1h for yfinance/local
+  paper: true                # true = paper trading (no real orders)
+  paper_equity: 10000.0      # Starting equity for paper mode (USD)
+  log: bot.log               # Log file path
+  local_dir: nasdaq          # CSV folder for --source local
+  local_prefix: nasdaq       # CSV filename prefix for --source local
+                             # Run backtest: python run_backtest_multi.py
+                             #   --symbol NQ/USD --source local
+                             #   --local-dir nasdaq --local-prefix nasdaq
+                             #   --no-plot --instrument fin_futures
+                             #   --exec-tf 1h --config config.yaml
+
+# ── Risk Management ───────────────────────────────────────
+risk:
+  max_risk_per_trade: 0.01   # Max % of equity risked per trade (0.01 = 1%)
+  max_daily_loss: 0.03       # Daily loss limit → halts bot for rest of day (0.03 = 3%)
+  max_drawdown: 0.10         # Peak-to-trough halt threshold (0.10 = 10%)
+                             # Manual reset required: bot.risk.manual_reset()
+  max_concurrent_positions: 2
+  min_rr_ratio: 2.0          # Minimum reward-to-risk (2.0 — sweep showed 2.0 > 2.5)
+  kill_zone_only: true       # Only trade during London / NY / NY-PM sessions
+
+# ── Signal Engine ─────────────────────────────────────────
+signal:
+  min_conditions: 6          # Conditions required out of 7 (strict A+ — no grace)
+                             # Sweep tested 5, 6, 7 — 6 gives best quality/frequency
+  min_rr: 2.0                # Minimum RR to emit a signal
+  sl_atr_buffer: 1.0         # SL placed this many ATR beyond structure level
+                             # CRITICAL: raised from 0.50 to 1.0 — biggest perf driver
+                             # NASDAQ volatility requires wider stops to avoid noise
+  default_rr_mult: 3.5       # TP2 fallback multiple — raised for strong NASDAQ trends
+  min_risk_atr: 1.0          # SL must be >= this x ATR (relaxed for 1h bars)
+  ema_period: 50             # 4h EMA period for HTF trend filter (~5 weeks)
+  tp1_rr: 1.5                # TP1 partial close target in R (raised from 1.0)
+                             # Taking partial profits at 1.5R improves overall PF
+  choch_lookback: 8          # Bars to look back for CHoCH (reduced for faster NASDAQ)
+  sweep_lookback: 12         # Bars for liquidity sweep window (12h on 1h exec frame)
+                             # Sweep tested 8-48; 12 matches 8 for quality but
+                             # is slightly more robust to bar-boundary timing
+
+# ── Data Feed ─────────────────────────────────────────────
+data:
+  bars:                      # Bars fetched per timeframe
+    4h: 200
+    1h: 500
+    5m: 1000
+  swing_n:                   # Rolling window for swing high/low detection
+    4h: 10
+    1h: 5
+    5m: 5
+  sessions:                  # Kill-zone windows in UTC hours [start, end)
+    london:
+      enabled: true          # London pre-market sweep is relevant for NQ
+      hours: [7.0, 10.0]     # 7am-10am UTC (3am-6am ET)
+    newyork:
+      enabled: true          # Primary US equity index session
+      hours: [13.0, 16.5]   # 9am-12:30pm ET = 13:00-16:30 UTC
+    nypm:
+      enabled: true          # Best session for NQ — 63.6% WR in backtest
+      hours: [18.5, 21.0]   # 2:30pm-5pm ET = 18:30-21:00 UTC
+
+# ── Telegram Alerts ───────────────────────────────────────
+telegram:
+  enabled: false             # true = send alerts (requires TELEGRAM_TOKEN + TELEGRAM_CHAT_ID in .env)
