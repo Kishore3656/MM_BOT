@@ -35,6 +35,7 @@ Entry point
 from __future__ import annotations
 
 import os
+import time as _time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,6 +146,32 @@ def _build_df(rows: list[list], ts_unit: str = "ms") -> pd.DataFrame:
     df.set_index("timestamp", inplace=True)
     df.sort_index(inplace=True)
     return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Retry helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_with_retry(fetch_fn, *args, max_retries: int = 3, base_delay: float = 1.0, **kwargs):
+    """
+    Call fetch_fn(*args, **kwargs) up to max_retries times with exponential backoff.
+    Raises the last exception if all attempts fail.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            return fetch_fn(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                warnings.warn(
+                    f"[data_feed] fetch failed (attempt {attempt + 1}/{max_retries}): {exc}. "
+                    f"Retrying in {delay:.1f}s…",
+                    stacklevel=2,
+                )
+                _time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 
 # ── ccxt (crypto) ─────────────────────────────────────────────────────────────
@@ -310,11 +337,11 @@ def fetch_mtf(
     result: dict[str, pd.DataFrame] = {}
 
     for tf in ("4h", "1h", "5m"):
-        # ── 1. Fetch raw OHLCV ────────────────────────────────────────────
+        # ── 1. Fetch raw OHLCV (with retry for network sources) ──────────────
         if resolved_source == "ccxt":
-            df = _fetch_ccxt(symbol, exchange, tf, effective_limits[tf])
+            df = _fetch_with_retry(_fetch_ccxt, symbol, exchange, tf, effective_limits[tf])
         elif resolved_source == "oanda":
-            df = _fetch_oanda(symbol, exchange, tf, effective_limits[tf])
+            df = _fetch_with_retry(_fetch_oanda, symbol, exchange, tf, effective_limits[tf])
         elif resolved_source == "local":
             df = _fetch_local(tf, local_dir, local_prefix)
         else:

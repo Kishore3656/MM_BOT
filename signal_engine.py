@@ -55,16 +55,19 @@ except Exception:  # pragma: no cover
     ICTRiskManager = None  # type: ignore[assignment]
 
 # ── Tunable parameters ────────────────────────────────────────────────────────
-KILL_ZONES:      frozenset[str] = frozenset({"london", "newyork", "nypm"})
-CHOCH_LOOKBACK:  int   = 10     # bars to look back for a directional CHoCH
-SWEEP_LOOKBACK:  int   = 24     # bars to look back for a liquidity sweep (24 × 5m = 2 h)
-SL_ATR_BUFFER:   float = 0.50   # SL placed SL_ATR_BUFFER × atr14 beyond structure low/high
-DEFAULT_RR_MULT: float = 3.0    # fallback TP2 multiple when no liquidity level exists
-MIN_RR:          float = 2.0    # minimum RR to emit a signal
-MIN_CONDITIONS:  int   = 6      # out of 7 — 7 = full A+, 6 = one-condition grace
-MIN_RISK_ATR:    float = 1.5    # SL must be ≥ this × ATR from entry (filters near-zero risk)
-EMA_PERIOD:      int   = 50     # 4h EMA period for trend filter (~5 weeks, matches 60d execution window)
-TP1_RR:          float = 1.0    # TP1 at 1R — partial close locks in profit and activates BE
+KILL_ZONES:           frozenset[str] = frozenset({"london", "newyork", "nypm"})
+CHOCH_LOOKBACK:       int   = 10     # bars to look back for a directional CHoCH
+SWEEP_LOOKBACK:       int   = 36     # bars to look back for a liquidity sweep (36 × 5m = 3 h)
+SL_ATR_BUFFER:        float = 0.75   # SL placed SL_ATR_BUFFER × atr14 beyond structure low/high
+DEFAULT_RR_MULT:      float = 3.0    # fallback TP2 multiple when no liquidity level exists
+MIN_RR:               float = 2.5    # minimum RR to emit a signal (raised from 2.0 → filters marginal setups)
+MIN_CONDITIONS:       int   = 6      # out of 7 — 7 = full A+, 6 = one-condition grace
+MIN_RISK_ATR:         float = 1.5    # SL must be ≥ this × ATR from entry (filters near-zero risk)
+EMA_PERIOD:           int   = 50     # 4h EMA period for trend filter (~5 weeks, matches 60d execution window)
+TP1_RR:               float = 1.0    # TP1 at 1R — partial close locks in profit and activates BE
+ADX_PERIOD:           int   = 14     # Wilder's ADX period on 4H — regime filter
+ADX_THRESHOLD:        float = 15.0   # ADX > threshold = trending market (valid for ICT setups)
+DISPLACEMENT_ATR_MULT: float = 1.2   # C4: displacement candle must span ≥ this × ATR14
 
 CONDITION_NAMES: list[str] = [
     "c1_htf_bias",
@@ -77,7 +80,7 @@ CONDITION_NAMES: list[str] = [
 ]
 
 # ── Required columns per DataFrame ───────────────────────────────────────────
-_REQ_4H = ["structure", "close"]
+_REQ_4H = ["structure", "close", "high", "low"]
 _REQ_5M = [
     "session",
     "structure", "last_structure_high", "last_structure_low", "choch",
@@ -115,6 +118,79 @@ def _align_series(series: pd.Series, ltf_index: pd.DatetimeIndex) -> pd.Series:
     """Forward-fill a single HTF Series onto a lower-timeframe index."""
     combined_idx = series.index.union(ltf_index)
     return series.reindex(combined_idx).ffill().reindex(ltf_index)
+
+
+def _compute_adx(df: pd.DataFrame, period: int = ADX_PERIOD) -> pd.Series:
+    """
+    Wilder's Average Directional Index (ADX) on a OHLC DataFrame.
+    Returns a Series aligned to df.index, NaN for the first ~2×period bars.
+    Requires columns: high, low, close.
+
+    Seeding:
+      TR / +DM / -DM   → sum seed  (Wilder convention; ratio cancels out in +DI/-DI)
+      DX → ADX         → mean seed (DX is already normalized to [0,100]; sum would inflate)
+    """
+    high  = df["high"].values.astype(float)
+    low   = df["low"].values.astype(float)
+    close = df["close"].values.astype(float)
+    n = len(high)
+
+    tr    = np.empty(n);  tr[0]    = np.nan
+    pdm   = np.empty(n);  pdm[0]   = np.nan
+    ndm   = np.empty(n);  ndm[0]   = np.nan
+
+    for i in range(1, n):
+        hl  = high[i]  - low[i]
+        hpc = abs(high[i]  - close[i - 1])
+        lpc = abs(low[i]   - close[i - 1])
+        tr[i] = max(hl, hpc, lpc)
+
+        up   = high[i] - high[i - 1]
+        down = low[i - 1] - low[i]
+        pdm[i] = up   if (up   > down and up   > 0) else 0.0
+        ndm[i] = down if (down > up   and down > 0) else 0.0
+
+    alpha = 1.0 / period
+
+    def _wilder_sum(arr: np.ndarray) -> np.ndarray:
+        """Wilder smooth seeded with sum — correct for TR, +DM, -DM."""
+        out = np.full(n, np.nan)
+        first_valid = np.where(~np.isnan(arr))[0]
+        if len(first_valid) < period:
+            return out
+        s = int(first_valid[0])
+        out[s + period - 1] = np.nansum(arr[s: s + period])
+        for i in range(s + period, n):
+            out[i] = out[i - 1] * (1 - alpha) + arr[i]
+        return out
+
+    def _wilder_mean(arr: np.ndarray) -> np.ndarray:
+        """
+        Standard EMA (alpha = 1/period) seeded with the simple mean of the first
+        `period` values. Used for DX → ADX because DX is already in [0, 100].
+        Formula: ADX[i] = ADX[i-1] + (DX[i] - ADX[i-1]) / period
+        """
+        out = np.full(n, np.nan)
+        valid = np.where(~np.isnan(arr))[0]
+        if len(valid) < period:
+            return out
+        s = int(valid[0])
+        out[s + period - 1] = np.nanmean(arr[s: s + period])
+        for i in range(s + period, n):
+            out[i] = out[i - 1] + (arr[i] - out[i - 1]) * alpha
+        return out
+
+    atr_w = _wilder_sum(tr)
+    pdm_w = _wilder_sum(pdm)
+    ndm_w = _wilder_sum(ndm)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pdi = 100.0 * pdm_w / atr_w
+        ndi = 100.0 * ndm_w / atr_w
+        dx  = 100.0 * np.abs(pdi - ndi) / (pdi + ndi)
+
+    adx = _wilder_mean(dx)
+    return pd.Series(adx, index=df.index)
 
 
 def _get_mtf_frame(mtf_data: dict[str, pd.DataFrame], *keys: str) -> pd.DataFrame | None:
@@ -182,19 +258,24 @@ def _build_conditions(
     """
     close = df_5m["close"]
 
-    # ── C1: HTF structural bias + EMA-50 trend filter + 1h confirmation ───────
+    # ── C1: HTF structural bias + EMA-50 trend filter + ADX regime filter ──────
     # EMA-50 on 4h close: only take longs when price is above the 4h trend,
-    # shorts when below. This prevents trading against strong trends (e.g.,
-    # going long AAPL/ETH in a downtrend or shorting gold in a bull run).
+    # shorts when below. This prevents trading against strong trends.
+    # ADX > threshold: only trade when the 4H market is actually trending.
+    # In ranging/choppy conditions (ADX < 20) ICT sweeps are noise, not setups.
     ema50_4h     = df_4h["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
     close_4h_5m  = _align_series(df_4h["close"], df_5m.index)
     ema50_5m     = _align_series(ema50_4h,        df_5m.index)
 
+    adx_4h       = _compute_adx(df_4h, period=ADX_PERIOD)
+    adx_5m       = _align_series(adx_4h, df_5m.index)
+    adx_trending = adx_5m > ADX_THRESHOLD
+
     trend_bull = close_4h_5m > ema50_5m
     trend_bear = close_4h_5m < ema50_5m
 
-    c1_long  = (htf_structure == "bullish") & trend_bull
-    c1_short = (htf_structure == "bearish") & trend_bear
+    c1_long  = (htf_structure == "bullish") & trend_bull & adx_trending
+    c1_short = (htf_structure == "bearish") & trend_bear & adx_trending
 
     # ── C2: Active kill zone ──────────────────────────────────────────────────
     c2 = df_5m["session"].isin(KILL_ZONES)
@@ -209,17 +290,28 @@ def _build_conditions(
     c3_long  = sweep_long.rolling(SWEEP_LOOKBACK,  min_periods=1).max().astype(bool)
     c3_short = sweep_short.rolling(SWEEP_LOOKBACK, min_periods=1).max().astype(bool)
 
-    # ── C4: CHoCH in the correct direction within lookback window ─────────────
-    # A bullish CHoCH = choch fired AND the previous bar was in bearish structure
+    # ── C4: CHoCH + displacement candle within lookback window ───────────────
+    # A bullish CHoCH = choch fired AND the previous bar was in bearish structure.
+    # Displacement confirmation: within the same window, require at least one
+    # impulsive candle (range ≥ DISPLACEMENT_ATR_MULT × ATR14). This confirms
+    # real institutional participation — fake/slow CHoCHs are rejected.
     prev_struct = df_5m["structure"].shift(1).fillna("consolidation")
     choch       = df_5m["choch"].eq(True)
 
     choch_bull = (choch & (prev_struct == "bearish")).astype(np.int8)
     choch_bear = (choch & (prev_struct == "bullish")).astype(np.int8)
 
+    # Displacement: bar range > DISPLACEMENT_ATR_MULT × ATR14
+    bar_range    = (df_5m["high"] - df_5m["low"])
+    displacement = (bar_range >= DISPLACEMENT_ATR_MULT * df_5m["atr14"]).astype(np.int8)
+
     window = choch_lookback
-    c4_long  = choch_bull.rolling(window, min_periods=1).max().astype(bool)
-    c4_short = choch_bear.rolling(window, min_periods=1).max().astype(bool)
+    choch_bull_win = choch_bull.rolling(window, min_periods=1).max().astype(bool)
+    choch_bear_win = choch_bear.rolling(window, min_periods=1).max().astype(bool)
+    displace_win   = displacement.rolling(window, min_periods=1).max().astype(bool)
+
+    c4_long  = choch_bull_win & displace_win
+    c4_short = choch_bear_win & displace_win
 
     # ── C5: Price zone alignment ──────────────────────────────────────────────
     c5_long  = df_5m["discount"].eq(True)

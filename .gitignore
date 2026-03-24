@@ -5,11 +5,12 @@ backtest_data/
 # Python virtual environment
 .venv/
 .
+.md
 # Python bytecode caches
 __pycache__/
 *.pyc
 PDF/
-
+.csv
 # Runtime artifacts
 bot.log
 bot_test.log

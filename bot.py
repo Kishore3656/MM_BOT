@@ -396,7 +396,8 @@ class PendingOrder:
     tp1: float
     tp2: float
     created_at: datetime
-    status: str = "pending"  # pending | filled | cancelled
+    status: str = "pending"          # pending | filled | cancelled
+    broker_order_id: str | None = None  # set for live orders
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -418,6 +419,25 @@ class BrokerBase:
         return None
 
     def get_last_price(self, symbol: str) -> float | None:
+        return None
+
+    def validate_credentials(self) -> None:
+        """Fail fast if credentials are missing or invalid. Override in live brokers."""
+        pass
+
+    def confirm_order(self, order_id: str, symbol: str = "", timeout: int = 30) -> dict:
+        """Poll until order is confirmed open/filled or timeout. Returns order dict."""
+        return {}
+
+    def cancel_order(self, order_id: str, symbol: str = "") -> None:
+        """Cancel a specific order on the broker."""
+        pass
+
+    def fetch_live_positions(self, symbol: str) -> list[dict] | None:
+        """
+        Return open positions from broker for symbol.
+        Returns None on fetch failure (to distinguish from 'no open positions').
+        """
         return None
 
 
@@ -484,6 +504,62 @@ class CCXTBroker(BrokerBase):
             self.logger.error(f"[ccxt] fetch_ticker failed: {e}")
             return None
 
+    def validate_credentials(self) -> None:
+        """Fail fast if CCXT_API_KEY / CCXT_API_SECRET are missing or invalid."""
+        key    = os.getenv("CCXT_API_KEY")
+        secret = os.getenv("CCXT_API_SECRET")
+        if not key or not secret:
+            raise EnvironmentError(
+                "CCXT_API_KEY and CCXT_API_SECRET must be set in .env for live trading.")
+        try:
+            self.logger.info("[ccxt] validating credentials via fetch_balance …")
+            bal = self.ex.fetch_balance()
+            keys = list((bal.get("total") or {}).keys())[:5]
+            self.logger.info(f"[ccxt] credentials OK — balance assets: {keys}")
+        except Exception as e:
+            raise EnvironmentError(f"[ccxt] credential validation failed: {e}") from e
+
+    def confirm_order(self, order_id: str, symbol: str = "", timeout: int = 30) -> dict:
+        """Poll fetch_order until status is open/filled/canceled, or timeout."""
+        import time as _t
+        deadline = _utc_now().timestamp() + timeout
+        while _utc_now().timestamp() < deadline:
+            try:
+                self.logger.debug(f"[ccxt] confirm_order {order_id} …")
+                order = self.ex.fetch_order(order_id, symbol or None)
+                status = order.get("status", "")
+                self.logger.info(f"[ccxt] order {order_id} status={status}")
+                if status in ("open", "closed", "filled"):
+                    return order
+                if status in ("canceled", "expired", "rejected"):
+                    raise RuntimeError(f"[ccxt] order {order_id} was {status}")
+            except RuntimeError:
+                raise
+            except Exception as e:
+                self.logger.warning(f"[ccxt] confirm_order poll error: {e}")
+            _t.sleep(2.0)
+        raise TimeoutError(f"[ccxt] order {order_id} not confirmed within {timeout}s")
+
+    def cancel_order(self, order_id: str, symbol: str = "") -> None:
+        try:
+            self.logger.info(f"[ccxt] cancel_order {order_id} {symbol}")
+            self.ex.cancel_order(order_id, symbol or None)
+        except Exception as e:
+            self.logger.error(f"[ccxt] cancel_order failed: {e}")
+
+    def fetch_live_positions(self, symbol: str) -> list[dict] | None:
+        """Fetch open positions. Returns None on API failure."""
+        try:
+            self.logger.debug(f"[ccxt] fetch_positions {symbol}")
+            positions = self.ex.fetch_positions([symbol])
+            open_pos = [p for p in positions
+                        if float(p.get("contracts") or p.get("amount") or 0) != 0]
+            self.logger.info(f"[ccxt] open positions for {symbol}: {len(open_pos)}")
+            return open_pos
+        except Exception as e:
+            self.logger.error(f"[ccxt] fetch_positions failed: {e}")
+            return None
+
     def place_bracket_order(self, pos: Position) -> dict[str, Any]:
         """
         Best-effort bracket via ccxt.
@@ -501,21 +577,35 @@ class CCXTBroker(BrokerBase):
         opp  = "sell" if side == "buy" else "buy"
         out: dict[str, Any] = {"entry": None, "sl": None, "tp": None}
         try:
+            self.logger.info(
+                f"[ccxt] create_order LIMIT {side} {pos.symbol} "
+                f"units={pos.units} price={pos.entry}")
             out["entry"] = self.ex.create_order(
                 pos.symbol, "limit", side, pos.units, pos.entry)
+            self.logger.info(f"[ccxt] entry order id={out['entry'].get('id')} placed")
         except Exception as e:
             self.logger.error(f"[ccxt] entry order failed: {e}")
             return {"status": "failed", "error": str(e)}
+        # Confirm entry order was accepted
         try:
+            self.confirm_order(out["entry"]["id"], pos.symbol, timeout=15)
+        except Exception as e:
+            self.logger.error(f"[ccxt] entry order confirmation failed: {e}")
+            return {"status": "failed", "error": f"confirmation: {e}"}
+        try:
+            self.logger.info(f"[ccxt] create_order STOP {opp} sl={pos.stop_loss}")
             out["sl"] = self.ex.create_order(
                 pos.symbol, "stop", opp, pos.units, None,
                 params={"reduceOnly": True, "stopPrice": pos.stop_loss})
+            self.logger.info(f"[ccxt] sl order id={out['sl'].get('id')} placed")
         except Exception as e:
             self.logger.warning(f"[ccxt] stop order not placed: {e}")
         try:
+            self.logger.info(f"[ccxt] create_order TAKE_PROFIT {opp} tp={pos.tp2}")
             out["tp"] = self.ex.create_order(
                 pos.symbol, "take_profit", opp, pos.units, None,
                 params={"reduceOnly": True, "stopPrice": pos.tp2})
+            self.logger.info(f"[ccxt] tp order id={out['tp'].get('id')} placed")
         except Exception as e:
             self.logger.warning(f"[ccxt] take-profit order not placed: {e}")
         return {"status": "placed", "orders": out}
@@ -547,10 +637,73 @@ class OandaBroker(BrokerBase):
     def get_data_client(self):
         return self.client
 
+    def validate_credentials(self) -> None:
+        """Fail fast if OANDA credentials are invalid."""
+        try:
+            import oandapyV20.endpoints.accounts as accounts  # type: ignore
+            self.logger.info("[oanda] validating credentials via AccountSummary …")
+            req = accounts.AccountSummary(self.account_id)
+            self.client.request(req)
+            currency = req.response.get("account", {}).get("currency", "?")
+            self.logger.info(f"[oanda] credentials OK — account currency={currency}")
+        except Exception as e:
+            raise EnvironmentError(f"[oanda] credential validation failed: {e}") from e
+
+    def confirm_order(self, order_id: str, symbol: str = "", timeout: int = 30) -> dict:
+        """Poll OANDA order status until PENDING or FILLED, or timeout."""
+        import time as _t
+        import oandapyV20.endpoints.orders as orders  # type: ignore
+        deadline = _utc_now().timestamp() + timeout
+        while _utc_now().timestamp() < deadline:
+            try:
+                self.logger.debug(f"[oanda] confirm_order {order_id} …")
+                req = orders.OrderDetails(self.account_id, order_id)
+                self.client.request(req)
+                order = req.response.get("order", {})
+                state = order.get("state", "")
+                self.logger.info(f"[oanda] order {order_id} state={state}")
+                if state in ("PENDING", "FILLED"):
+                    return order
+                if state in ("CANCELLED", "EXPIRED"):
+                    raise RuntimeError(f"[oanda] order {order_id} was {state}")
+            except RuntimeError:
+                raise
+            except Exception as e:
+                self.logger.warning(f"[oanda] confirm_order poll error: {e}")
+            _t.sleep(2.0)
+        raise TimeoutError(f"[oanda] order {order_id} not confirmed within {timeout}s")
+
+    def cancel_order(self, order_id: str, symbol: str = "") -> None:
+        try:
+            import oandapyV20.endpoints.orders as orders  # type: ignore
+            self.logger.info(f"[oanda] cancel_order {order_id}")
+            req = orders.OrderCancel(self.account_id, order_id)
+            self.client.request(req)
+        except Exception as e:
+            self.logger.error(f"[oanda] cancel_order failed: {e}")
+
+    def fetch_live_positions(self, symbol: str) -> list[dict] | None:
+        """Fetch open trades for symbol. Returns None on API failure."""
+        try:
+            import oandapyV20.endpoints.trades as trades_ep  # type: ignore
+            self.logger.debug(f"[oanda] fetch_open_trades {symbol}")
+            req = trades_ep.TradesList(
+                self.account_id, params={"instrument": symbol, "state": "OPEN"})
+            self.client.request(req)
+            trade_list = req.response.get("trades", [])
+            self.logger.info(f"[oanda] open trades for {symbol}: {len(trade_list)}")
+            return trade_list
+        except Exception as e:
+            self.logger.error(f"[oanda] fetch_open_trades failed: {e}")
+            return None
+
     def place_bracket_order(self, pos: Position) -> dict[str, Any]:
         try:
             import oandapyV20.endpoints.orders as orders  # type: ignore
             units = pos.units if pos.side == "long" else -pos.units
+            self.logger.info(
+                f"[oanda] OrderCreate LIMIT {pos.side} {pos.symbol} "
+                f"units={units} price={pos.entry} sl={pos.stop_loss} tp={pos.tp2}")
             data = {
                 "order": {
                     "type": "LIMIT",
@@ -565,7 +718,9 @@ class OandaBroker(BrokerBase):
             }
             req = orders.OrderCreate(self.account_id, data=data)
             self.client.request(req)
-            return {"status": "placed", "response": req.response}
+            order_id = (req.response.get("orderCreateTransaction") or {}).get("id")
+            self.logger.info(f"[oanda] order placed id={order_id}")
+            return {"status": "placed", "response": req.response, "order_id": order_id}
         except Exception as e:
             self.logger.error(f"[oanda] order failed: {e}")
             return {"status": "failed", "error": str(e)}
@@ -810,6 +965,106 @@ class ICTLiveBot:
                 self.notifier.send(
                     f"Order filled: {o.symbol} {o.side} entry={o.entry:.5f}")
 
+    # ── Live position reconciliation ──────────────────────────────────────────
+
+    # How many bars a limit order may sit unfilled before being cancelled
+    _MAX_PENDING_BARS = 3
+
+    def _reconcile_live_positions(self) -> None:
+        """
+        Live-mode only: fetch open positions from the broker and close any
+        positions in self.positions that the broker has already exited
+        (SL or TP hit on the exchange side).
+        Skipped silently if the broker fetch fails.
+        """
+        if isinstance(self.broker, PaperBroker) or not self.positions:
+            return
+        broker_pos = self.broker.fetch_live_positions(self.symbol)
+        if broker_pos is None:
+            # Fetch failed — don't touch internal state
+            return
+
+        # Build a set of symbols the broker reports as open
+        broker_open = set()
+        for bp in broker_pos:
+            sym = str(bp.get("symbol") or bp.get("instrument") or "")
+            if sym:
+                broker_open.add(sym)
+
+        still_open: list[Position] = []
+        for p in self.positions:
+            is_on_broker = any(
+                p.symbol in sym or sym in p.symbol for sym in broker_open
+            ) if broker_open else False
+
+            if not is_on_broker:
+                # Broker closed this position (SL or TP hit on their side)
+                last_price = self.broker.get_last_price(self.symbol)
+                exit_price = last_price if last_price else p.entry
+                pnl = (
+                    (exit_price - p.entry) * p.units
+                    if p.side == "long"
+                    else (p.entry - exit_price) * p.units
+                )
+                p.status = "closed"
+                self.logger.info(
+                    f"[reconcile] broker closed {p.symbol} {p.side} "
+                    f"exit≈{exit_price:.5f} pnl≈{pnl:+.2f} (broker-side SL/TP)")
+                if self.notifier:
+                    self.notifier.send(
+                        f"Broker closed: {p.symbol} {p.side} "
+                        f"exit≈{exit_price:.5f} pnl≈{pnl:+.2f}")
+                self.risk.update_daily_pnl(pnl)
+                eq = self.broker.get_equity()
+                self.peak_equity = max(self.peak_equity, eq)
+                self.risk.check_drawdown(eq, self.peak_equity)
+                self.risk.log_trade({
+                    "symbol":    p.symbol,   "side":      p.side,
+                    "units":     p.units,    "entry":     p.entry,
+                    "exit":      exit_price, "pnl":       pnl,
+                    "tp1_hit":   p.tp1_hit,  "tp2":       p.tp2,
+                    "stop_loss": p.stop_loss,
+                    "opened_at": p.opened_at.isoformat(),
+                    "closed_at": _utc_now().isoformat(),
+                    "mode": "live", "event": "closed_by_broker",
+                })
+            else:
+                still_open.append(p)
+        self.positions = still_open
+
+    def _expire_stale_pending(self) -> None:
+        """
+        Cancel pending orders that have not filled within _MAX_PENDING_BARS cycles.
+        For live orders (broker_order_id set), also cancels on the broker side.
+        """
+        if not self.pending_orders:
+            return
+        bar_duration = (
+            timedelta(hours=1)
+            if self._effective_exec_tf == "1h"
+            else timedelta(minutes=5)
+        )
+        max_age = bar_duration * self._MAX_PENDING_BARS
+        now = _utc_now()
+
+        still_pending: list[PendingOrder] = []
+        for o in self.pending_orders:
+            if o.status != "pending":
+                continue
+            if now - o.created_at > max_age:
+                self.logger.info(
+                    f"[pending] expire stale order {o.symbol} {o.side} "
+                    f"entry={o.entry:.5f} age={(now - o.created_at)}")
+                if o.broker_order_id and not isinstance(self.broker, PaperBroker):
+                    self.broker.cancel_order(o.broker_order_id, o.symbol)
+                if self.notifier:
+                    self.notifier.send(
+                        f"Order expired: {o.symbol} {o.side} "
+                        f"entry={o.entry:.5f} (no fill in {self._MAX_PENDING_BARS} bars)")
+            else:
+                still_pending.append(o)
+        self.pending_orders = still_pending
+
     # ── Main cycle ────────────────────────────────────────────────────────────
 
     def run_cycle(self) -> None:
@@ -843,7 +1098,9 @@ class ICTLiveBot:
             self.last_cycle_bar = last_bar_time
 
             last_price = float(df_exec["close"].iloc[-1])
+            self._expire_stale_pending()
             self._paper_fill_pending(df_exec.iloc[-1])
+            self._reconcile_live_positions()
             self._mark_to_market_and_manage(last_price)
 
             # min_risk_atr matches backtest: tighter for 1h (ATR already large)
@@ -910,9 +1167,27 @@ class ICTLiveBot:
                 resp = {"mode": "paper", "status": "pending"}
             else:
                 resp = self.broker.place_bracket_order(pos)
-                self.logger.info(f"[trade] placed: {resp}")
+                self.logger.info(f"[trade] broker response: {resp}")
                 if resp.get("status") == "placed":
-                    self.positions.append(pos)
+                    # Extract entry order_id from broker response (ccxt or oanda)
+                    orders_out = resp.get("orders", {})
+                    entry_order = orders_out.get("entry") or {}
+                    broker_order_id = (
+                        entry_order.get("id")
+                        or str(resp.get("order_id") or "")
+                        or None
+                    )
+                    # Track as pending until fill is confirmed via reconciliation
+                    live_order = PendingOrder(
+                        symbol=self.symbol, side=side, units=units,
+                        entry=pos.entry, stop_loss=pos.stop_loss,
+                        tp1=pos.tp1, tp2=pos.tp2, created_at=_utc_now(),
+                        broker_order_id=broker_order_id,
+                    )
+                    self.pending_orders.append(live_order)
+                    self.logger.info(
+                        f"[trade] live LIMIT order queued "
+                        f"id={broker_order_id} entry={pos.entry:.5f}")
 
             if self.notifier:
                 self.notifier.send(
@@ -949,11 +1224,15 @@ def _build_broker(args: argparse.Namespace, logger: logging.Logger) -> BrokerBas
             logger.info("[broker] yfinance source → paper-only mode (no live broker)")
         return PaperBroker(initial_equity=float(args.paper_equity), logger=logger)
     if args.source == "ccxt":
-        return CCXTBroker(
+        broker = CCXTBroker(
             exchange_id=args.exchange_id, logger=logger,
             allow_unsafe_brackets=bool(args.allow_unsafe_live))
+        broker.validate_credentials()
+        return broker
     if args.source == "oanda":
-        return OandaBroker(logger=logger, environment=args.oanda_env)
+        broker = OandaBroker(logger=logger, environment=args.oanda_env)
+        broker.validate_credentials()
+        return broker
     raise ValueError(
         "[bot] live mode requires --source ccxt or --source oanda "
         "(or use --paper / --source yfinance).")
